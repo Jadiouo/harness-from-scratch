@@ -1,0 +1,5 @@
+.venv/
+logs/
+sandbox/
+__pycache__/
+.scratch/
