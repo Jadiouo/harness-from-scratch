@@ -3,3 +3,4 @@ logs/
 sandbox/
 __pycache__/
 .scratch/
+.env
