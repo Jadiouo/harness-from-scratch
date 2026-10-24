@@ -2,7 +2,7 @@ import os
 import json, sys
 from pathlib import Path
 import anthropic, httpx2, pytest
-from anthropic.types.beta import BetaMessage, BetaTextBlock, BetaToolUseBlock
+from anthropic.types.beta import BetaMessage, BetaTextBlock, BetaToolUseBlock, BetaUsage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent
@@ -14,9 +14,10 @@ def text(t):
 def tool(id, name, **inp):
     return BetaToolUseBlock.model_construct(type="tool_use", id=id, name=name, input=inp)
 
-def msg(blocks, stop_reason):
+def msg(blocks, stop_reason, usage=None):
+    extra = {"usage": BetaUsage.model_construct(input_tokens=usage[0], output_tokens=usage[1])} if usage else {}
     return BetaMessage.model_construct(id="m", type="message", role="assistant", model="fake",
-                                       content=blocks, stop_reason=stop_reason, stop_details=None)
+                                       content=blocks, stop_reason=stop_reason, stop_details=None, **extra)
 
 class FakeClient:
     def __init__(self, script):
@@ -24,7 +25,7 @@ class FakeClient:
         self.beta = self
         self.messages = self
     def create(self, **kwargs):
-        self.calls.append(kwargs)
+        self.calls.append({**kwargs, "messages": list(kwargs["messages"])})   # 拷貝：loop 之後還會往原 list 加東西
         r = self.script.pop(0)
         if isinstance(r, Exception):
             raise r
@@ -37,6 +38,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(agent, "PERMISSION_MODE", "allow_all")   # v1 的測試不關心權限；v2 的測試用 ask_env 改回 ask
     monkeypatch.setattr(agent, "SESSION_ALLOW", set())
+    monkeypatch.setattr(agent, "LAST_USAGE", None)
+    monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 0)
+    monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)   # 預設值是給真實測驗用的 8000；單元測試用固定值
     return tmp_path
 
 def run(script, env, user="go", messages=None):
@@ -100,7 +104,7 @@ def test_max_turns_then_repl_append(env, monkeypatch):
 def test_log(env):
     script = [msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")]
     _, _, log = run(script, env)
-    lines = [l for l in log.read_text().splitlines() if "permission" not in l]   # permission 行另外測
+    lines = [l for l in log.read_text().splitlines() if "request" in l]   # permission、tool_result 行另外測
     assert len(lines) == 2
     for i, l in enumerate(lines, 1):
         d = json.loads(l)
@@ -736,3 +740,390 @@ def test_summarize_item5_real_log_fails_and_skipped_log_passes(tmp_path):
     fake = tmp_path / "skipped.jsonl"
     fake.write_text("\n".join(json.dumps(r) for r in rows))
     assert item5(fake)[0] is True
+
+
+# ==== v3：上下文管理（compaction）====
+def user_blocks(messages):
+    return [b for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"]
+
+def compaction_script(summary="摘要內容", usage=(30000, 100)):
+    """第 1 輪回 tool_use 且 usage 超過門檻 → 第 2 輪前壓縮（摘要請求）→ 之後照常結束。"""
+    return [msg([tool("a", "bash", command="echo 1")], "tool_use", usage=usage),
+            msg([text(summary)], "end_turn"),
+            msg([text("done")], "end_turn", usage=(500, 10))]
+
+def test_compaction_replaces_history_in_place(env, monkeypatch):
+    monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)
+    messages = []
+    agent.add_user_text(messages, "請處理三個檔案")
+    original = messages
+    client = FakeClient(compaction_script())
+    log = agent.new_log_path()
+    agent.run_turn(client, messages, log)
+    summary_call, after_call = client.calls[1], client.calls[2]
+    assert summary_call["tool_choice"] == {"type": "none"} and summary_call["tools"] == agent.TOOLS
+    assert summary_call["system"] == agent.SYSTEM_PROMPT and summary_call["tools"] == agent.TOOLS   # 綁定前綴不能變
+    assert messages is original   # 原地替換，REPL 持有的 list 才會一起更新
+    assert len(after_call["messages"]) == 1 and after_call["messages"][0]["role"] == "user"
+    blocks = [b["text"] for b in after_call["messages"][0]["content"]]
+    assert blocks[0].startswith(agent.HEADER_PREFIX) and blocks[1] == agent.USER_PREFIX + "請處理三個檔案"
+    assert blocks[2].startswith(agent.SUMMARY_PREFIX + "摘要內容") and blocks[2].endswith("請接著完成任務。") and len(blocks) == 3
+    assert "tool_choice" not in after_call   # 正常呼叫不禁止工具
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    check_pairing(messages)
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    c = next(r["compaction"] for r in rows if "compaction" in r)
+    assert c["before_tokens"] == 30100 and c["messages_before"] == 3 and c["summary"] == "摘要內容"
+    assert c["user_texts"] == ["請處理三個檔案"]
+
+def test_summary_request_does_not_touch_original_messages(env, monkeypatch):
+    messages = []
+    agent.add_user_text(messages, "任務")
+    messages += [{"role": "assistant", "content": [tool("a", "bash", command="ls")]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x"}]}]
+    last_user = messages[-1]
+    client = FakeClient([msg([text("S")], "end_turn")])
+    assert agent.compact(client, messages, agent.new_log_path()) is True
+    sent = client.calls[0]["messages"]
+    assert sent[-1]["content"][-1]["text"] == agent.SUMMARY_REQUEST and len(sent[-1]["content"]) == 2
+    assert len(last_user["content"]) == 1   # 原本的那則 user 沒被附加（附加只發生在拷貝）
+    # 壓縮前的原最後一則 user 沒有被附加指示：用另一份未壓縮的歷史再檢查一次
+    m2 = [{"role": "user", "content": [{"type": "text", "text": "任務"}]}]
+    m2 += [{"role": "assistant", "content": [tool("a", "bash", command="ls")]},
+           {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x"}]}]
+    c2 = FakeClient([APIErr()])
+    agent.compact(c2, m2, agent.new_log_path())
+    assert len(m2[-1]["content"]) == 1 and m2[-1]["content"][0]["type"] == "tool_result"
+
+def APIErr():
+    return anthropic.APIConnectionError(request=httpx2.Request("POST", "http://x")) if hasattr(httpx2, "Request") else None
+
+def test_no_compaction_when_tool_use_unpaired(env):
+    messages = [{"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [tool("a", "bash", command="ls")]}]
+    client = FakeClient([])
+    assert agent.compact(client, messages, agent.new_log_path()) is False
+    assert client.calls == [] and len(messages) == 2
+
+def test_summary_api_error_keeps_history_and_loop_continues(env, monkeypatch, capsys):
+    script = [msg([tool("a", "bash", command="echo 1")], "tool_use", usage=(30000, 10)),
+              APIErr(), msg([text("done")], "end_turn")]
+    client, messages, _ = run(script, env)
+    assert "摘要請求失敗" in capsys.readouterr().out
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant"]
+    assert len(client.calls[2]["messages"]) == 3 and client.calls[2]["messages"][0]["content"][0]["text"] == "go"   # 沒壓縮：歷史照舊
+    check_pairing(messages)
+
+def test_empty_summary_does_not_compact(env, capsys):
+    messages = [{"role": "user", "content": [{"type": "text", "text": "q"}]}]
+    client = FakeClient([msg([], "end_turn")])
+    assert agent.compact(client, messages, agent.new_log_path()) is False
+    assert "沒有文字" in capsys.readouterr().out and len(messages) == 1
+
+def test_no_usage_no_compaction(env):
+    script = [msg([tool("a", "bash", command="echo 1")], "tool_use"), msg([text("done")], "end_turn")]
+    client, messages, _ = run(script, env)
+    assert len(client.calls) == 2 and all("tool_choice" not in c for c in client.calls)
+    assert agent.needs_compaction(None) is False
+    assert agent.needs_compaction(BetaUsage.model_construct(input_tokens=20001, output_tokens=0)) is True
+    assert agent.needs_compaction(BetaUsage.model_construct(input_tokens=10000, output_tokens=10000)) is False
+
+def test_compaction_keeps_all_user_texts_and_loop_stays_valid(env):
+    messages = []
+    agent.add_user_text(messages, "第一句")
+    client = FakeClient([msg([tool("a", "bash", command="echo 1")], "tool_use", usage=(100, 1)),
+                         msg([text("ok")], "end_turn", usage=(100, 1))])
+    agent.run_turn(client, messages, agent.new_log_path())
+    agent.add_user_text(messages, "第二句：不要改 check.py")
+    client2 = FakeClient([msg([text("S")], "end_turn"), msg([tool("b", "bash", command="echo 2")], "tool_use", usage=(100, 1)),
+                          msg([text("done")], "end_turn")])
+    assert agent.compact(client2, messages, agent.new_log_path()) is True
+    blocks = [b["text"] for b in messages[0]["content"]]
+    assert agent.USER_PREFIX + "第一句" in blocks and agent.USER_PREFIX + "第二句：不要改 check.py" in blocks
+    agent.run_turn(client2, messages, agent.new_log_path())
+    check_pairing(messages)
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant"]
+
+def repl(monkeypatch, client, inputs):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setattr(agent, "load_env", lambda: None)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda: client)
+    monkeypatch.setattr(agent, "WORKDIR", agent.WORKDIR)
+    monkeypatch.setattr(sys, "argv", ["agent.py"])
+    it = iter(inputs)
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(it))
+    agent.main()
+
+def test_repl_compact_and_tokens(env, monkeypatch, capsys):
+    client = FakeClient([msg([text("hi")], "end_turn", usage=(1234, 56)),
+                         msg([text("S")], "end_turn"),
+                         msg([text("again")], "end_turn", usage=(77, 8))])
+    repl(monkeypatch, client, ["你好", "/tokens", "/compact", "/tokens", "再來", "/tokens", "/exit"])
+    out = capsys.readouterr().out
+    assert out.count("最近一次回應：input=1234 output=56") == 1   # 只有壓縮前那次；壓縮後 usage 清空
+    assert "還沒有 usage 紀錄" in out and "🗜 context 壓縮：1290 tokens → 摘要 1 字" in out
+    assert "input=77 output=8" in out
+    assert client.calls[1]["tool_choice"] == {"type": "none"}   # /compact 不管門檻（1290 < 20000）
+    assert client.calls[2]["messages"][0]["content"][1]["text"] == agent.USER_PREFIX + "你好"
+    assert client.calls[2]["messages"][0]["content"][-1]["text"] == "再來"   # 壓縮後再打的字附加在同一則 user 後面
+
+def test_repl_compact_on_empty_history(env, monkeypatch, capsys):
+    client = FakeClient([])
+    repl(monkeypatch, client, ["/compact", "/tokens", "/exit"])
+    out = capsys.readouterr().out
+    assert "沒有壓縮" in out and "還沒有 usage 紀錄" in out and client.calls == []
+
+
+# ---- v3 fixture：docstring_repo ----
+DOC_FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "docstring_repo"
+
+def copy_doc_fixture(dst):
+    import shutil
+    shutil.copytree(DOC_FIXTURE, dst, ignore=shutil.ignore_patterns("__pycache__"))
+
+def run_doc_check(repo):
+    import subprocess
+    return subprocess.run(["python3", "check_docstrings.py"], cwd=repo, capture_output=True, text=True,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+def add_docstrings(repo):
+    import ast
+    for f in repo.rglob("*.py"):
+        if f.name == "check_docstrings.py":
+            continue
+        lines = f.read_text().splitlines()
+        funcs = [n for n in ast.walk(ast.parse(f.read_text())) if isinstance(n, ast.FunctionDef)]
+        for n in sorted(funcs, key=lambda n: n.body[0].lineno, reverse=True):   # 由後往前插，行號才不會位移
+            lines.insert(n.body[0].lineno - 1, " " * (n.col_offset + 4) + '"""一行說明。"""')
+        f.write_text("\n".join(lines) + "\n")
+
+def test_doc_fixture_fails_and_lists_every_function(tmp_path):
+    copy_doc_fixture(tmp_path / "r")
+    r = run_doc_check(tmp_path / "r")
+    missing = [l for l in r.stderr.splitlines() if l.startswith("FAIL 沒有 docstring")]
+    assert r.returncode != 0 and "ALL OK" not in r.stdout
+    assert len(missing) == 56 and "text/wrap.py:first_line" in r.stderr
+    assert len(list((tmp_path / "r").rglob("*.py"))) == 25   # 24 個模組 + 檢查器
+
+def test_doc_fixture_with_docstrings_is_all_ok(tmp_path):
+    copy_doc_fixture(tmp_path / "r")
+    add_docstrings(tmp_path / "r")
+    r = run_doc_check(tmp_path / "r")
+    assert r.returncode == 0 and "ALL OK" in r.stdout, r.stderr
+
+def test_doc_fixture_deleting_a_function_fails(tmp_path):
+    copy_doc_fixture(tmp_path / "r")
+    add_docstrings(tmp_path / "r")
+    (tmp_path / "r/text/vowels.py").write_text('def count_vowels(s):\n    """數母音。"""\n    return 0\n')
+    r = run_doc_check(tmp_path / "r")
+    assert r.returncode != 0 and "函式數量 55 != 預期 56" in r.stderr
+
+def test_doc_fixture_syntax_error_fails(tmp_path):
+    copy_doc_fixture(tmp_path / "r")
+    add_docstrings(tmp_path / "r")
+    (tmp_path / "r/text/vowels.py").write_text("def count_vowels(s:\n")
+    r = run_doc_check(tmp_path / "r")
+    assert r.returncode != 0 and "無法編譯" in r.stderr
+
+def test_doc_fixture_imports(tmp_path):
+    import subprocess
+    r = subprocess.run([sys.executable, "-c", "import glob, importlib.util as u\n"
+                        "for f in glob.glob('*/*.py'):\n s=u.spec_from_file_location('m',f); m=u.module_from_spec(s); s.loader.exec_module(m)"],
+                       cwd=DOC_FIXTURE, capture_output=True, text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert r.returncode == 0, r.stderr
+
+
+# ---- v3：summarize_log 的判定 ----
+def v3_setup(tmp_path, fixed=True):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    repo, fx = tmp_path / "sandbox" / "docstring_repo", tmp_path / "fixtures" / "docstring_repo"
+    copy_doc_fixture(fx); copy_doc_fixture(repo)
+    if fixed:
+        add_docstrings(repo)
+    return summarize_log, repo, fx
+
+def v3_log(tmp_path, n_calls=32, compact_after=16, peak=24000, reread=None, compact_at=20000):
+    rows, results = [], []
+    for i in range(1, n_calls + 1):
+        path = f"docstring_repo/f{i}.py"
+        name, inp = ("edit", {"path": path, "old_string": "a", "new_string": "b"})
+        if reread and i == reread[0]:
+            name, inp = "read_file", {"path": reread[1]}
+        rows.append({"turn": i, "request": {"messages": [{"role": "user", "content": results}] if results else []},
+                     "response": {"stop_reason": "tool_use", "usage": {"input_tokens": peak if i == compact_after else 3000, "output_tokens": 5},
+                                  "content": [{"type": "tool_use", "id": f"t{i}", "name": name, "input": inp}]}})
+        results = results + [{"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}]
+        if compact_after is not None and i == compact_after:
+            rows.append({"turn": i + 1, "compaction": {"before_tokens": peak, "messages_before": 2 * i, "summary": "摘要",
+                                                       "compact_at": compact_at, "user_texts": ["t"], "summary_usage": {"input_tokens": peak + 500, "output_tokens": 80}}})
+            results = []
+    p = tmp_path / "v3.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    return p
+
+def v3_verdicts(mod, log, repo, fx, capsys, extra=()):
+    mod.main([str(log), "--v3-repo", str(repo), "--v3-fixture", str(fx), *extra])
+    out = capsys.readouterr().out
+    sec = out.split("--- v3 完成標準判定 ---")[1]
+    return {l.split()[2][0]: l.split()[1] for l in sec.splitlines() if l.startswith(("✅", "❌"))}, out
+
+def test_v3_judge_all_pass(tmp_path, capsys):
+    mod, repo, fx = v3_setup(tmp_path)
+    v, out = v3_verdicts(mod, v3_log(tmp_path), repo, fx, capsys)
+    assert set(v.values()) == {"PASS"} and len(v) == 5, out
+    assert "🗜 compaction：24000 → 摘要 2 字" in out and "壓縮前 24000 → 壓縮後 3000" in out
+    assert "6. 壓縮後又 read_file" in out and "0 次" in out
+
+def test_v3_judge_no_compaction_fails_item2(tmp_path, capsys):
+    mod, repo, fx = v3_setup(tmp_path)
+    v, _ = v3_verdicts(mod, v3_log(tmp_path, compact_after=None), repo, fx, capsys)
+    assert v["2"] == "FAIL" and v["3"] == "FAIL" and v["1"] == "PASS" and v["4"] == "PASS"
+
+def test_v3_judge_too_few_calls_unfixed_and_peak(tmp_path, capsys):
+    mod, repo, fx = v3_setup(tmp_path, fixed=False)
+    v, out = v3_verdicts(mod, v3_log(tmp_path, n_calls=10, compact_after=5, peak=90000), repo, fx, capsys)
+    assert v["1"] == "FAIL" and v["4"] == "FAIL" and v["5"] == "FAIL"
+    # log 沒記錄門檻（舊 log）→ 用參數
+    old = v3_log(tmp_path, n_calls=10, compact_after=5, peak=90000, compact_at=None)
+    v, _ = v3_verdicts(mod, old, repo, fx, capsys, ("--compact-at", "50000"))
+    assert v["5"] == "PASS"
+    v, _ = v3_verdicts(mod, old, repo, fx, capsys)   # 預設 8000
+    assert v["5"] == "FAIL"
+
+def test_v3_judge_item5_prefers_logged_compact_at(tmp_path, capsys):
+    mod, repo, fx = v3_setup(tmp_path)
+    log = v3_log(tmp_path, peak=24000, compact_at=20000)
+    v, out = v3_verdicts(mod, log, repo, fx, capsys, ("--compact-at", "1000"))   # 參數會讓它 FAIL，log 的 20000 讓它 PASS
+    assert v["5"] == "PASS" and "門檻 20000（log）" in out
+
+def test_v3_judge_reports_amnesia_without_failing(tmp_path, capsys):
+    mod, repo, fx = v3_setup(tmp_path)
+    log = v3_log(tmp_path, reread=(20, "docstring_repo/f3.py"))   # f3 在壓縮前改好，壓縮後又被讀
+    v, out = v3_verdicts(mod, log, repo, fx, capsys)
+    assert set(v.values()) == {"PASS"} and "1 次" in out and "docstring_repo/f3.py" in out
+
+def test_v3_judge_absent_in_v1_log(tmp_path, capsys):
+    mod, repo, fx = judge_setup(tmp_path)
+    mod.main([str(fake_log(tmp_path, GOOD)), "--repo", str(repo), "--fixture", str(fx)])
+    assert "v3 完成標準判定" not in capsys.readouterr().out
+
+
+# ---- v3 修正：連續壓縮、截斷、冷卻、tool_result log、失憶偵測 ----
+def texts_of(messages):
+    return [b["text"] for m in messages if m["role"] == "user" for b in m["content"] if b["type"] == "text"]
+
+def test_consecutive_compaction_does_not_stack_summaries(env):
+    messages = []
+    agent.add_user_text(messages, "第一句")
+    assert agent.compact(FakeClient([msg([text("舊摘要AAA")], "end_turn")]), messages, agent.new_log_path())
+    agent.add_user_text(messages, "第二句")
+    client = FakeClient([msg([text("新摘要BBB")], "end_turn")])
+    assert agent.compact(client, messages, agent.new_log_path())
+    ts = texts_of(messages)
+    raw = [t.removeprefix(agent.USER_PREFIX) for t in ts if t.startswith(agent.USER_PREFIX)]
+    assert raw == ["第一句", "第二句"]
+    assert agent.user_texts(messages) == ["第一句", "第二句"]   # 沒有任何舊摘要／標頭被當成原文
+    assert not any("舊摘要AAA" in t for t in ts) and sum(t.startswith(agent.SUMMARY_PREFIX) for t in ts) == 1
+    assert "新摘要BBB" in ts[-1] and sum(t.startswith(agent.HEADER_PREFIX) for t in ts) == 1
+
+def log_rows(log):
+    return [json.loads(l) for l in log.read_text().splitlines()]
+
+def test_truncated_summary_is_not_adopted(env, capsys):
+    messages = [{"role": "user", "content": [{"type": "text", "text": "q"}]}]
+    before = list(messages)
+    log = agent.new_log_path()
+    assert agent.compact(FakeClient([msg([text("半截摘要")], "max_tokens")]), messages, log, 5) is False
+    assert messages == before and "max_tokens" in capsys.readouterr().out
+    assert [r["compaction_failed"] for r in log_rows(log) if "compaction_failed" in r][0]["reason"].endswith("max_tokens")
+    assert agent.COMPACT_COOLDOWN == agent.COMPACT_COOLDOWN_TURNS
+
+def summary_calls(client):
+    return sum(1 for c in client.calls if c.get("tool_choice") == {"type": "none"})
+
+def test_cooldown_after_failure_then_retry(env):
+    # 第 1 輪後 usage 超標 → 第 2 輪前嘗試（失敗）；第 3、4、5 輪冷卻；第 6 輪再試（第 2 輪的普通呼叫算在失敗那輪內）
+    tu = lambda i: msg([tool(f"t{i}", "bash", command="echo")], "tool_use", usage=(30000, 1))
+    script = [tu(1), msg([text("截")], "max_tokens"), tu(2), tu(3), tu(4), tu(5), msg([text("截")], "max_tokens"), msg([text("done")], "end_turn")]
+    client, _, log = run(script, env)
+    assert summary_calls(client) == 2
+    kinds = ["S" if c.get("tool_choice") else "N" for c in client.calls]
+    assert kinds == ["N", "S", "N", "N", "N", "N", "S", "N"]
+    assert sum("compaction_failed" in r for r in log_rows(log)) == 2
+
+def test_manual_compact_ignores_cooldown_and_reset_clears(env, monkeypatch):
+    monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 3)
+    messages = [{"role": "user", "content": [{"type": "text", "text": "q"}]}]
+    assert agent.compact(FakeClient([msg([text("S")], "end_turn")]), messages, agent.new_log_path()) is True
+    client = FakeClient([msg([text("hi")], "end_turn"), msg([text("S")], "end_turn")])
+    repl(monkeypatch, client, ["/compact", "/exit"])   # main() 開頭清冷卻；/compact 本來就不看它
+    assert agent.COMPACT_COOLDOWN == 0
+    monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 3)
+    client = FakeClient([msg([text("hi")], "end_turn"), msg([text("S")], "end_turn")])
+    repl(monkeypatch, client, ["你好", "/reset", "/exit"])
+    assert agent.COMPACT_COOLDOWN == 0
+
+def test_log_tool_result_lines(env, monkeypatch):
+    monkeypatch.setattr(agent, "PERMISSION_MODE", "ask")
+    monkeypatch.setattr(agent, "ask_user", lambda name, args, reason: ("n", "") if name == "write_file" else ("y", ""))
+    script = [msg([tool("a", "bash", command="echo hi"), tool("b", "read_file", path="missing.txt"),
+                   tool("c", "write_file", path="x.txt", content="1"), tool("d", "bash", command="echo no")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    _, _, log = run(script, env)
+    tr = {r["tool_result"]["id"]: r["tool_result"] for r in log_rows(log) if "tool_result" in r}
+    assert list(tr) == ["a", "b", "c", "d"]
+    assert tr["a"]["is_error"] is False and "hi" in tr["a"]["content"] and tr["a"]["tool"] == "bash"
+    assert tr["b"]["is_error"] is True
+    assert tr["c"]["is_error"] is True and "拒絕" in tr["c"]["content"]
+    assert tr["d"]["is_error"] is True and "沒有執行" in tr["d"]["content"]   # skipped
+    big = agent.execute_tool("bash", {"command": "echo hi"})
+    assert len(json.dumps(big["content"])) > 0 and all(len(v["content"]) <= 300 for v in tr.values())
+
+def test_compaction_log_has_compact_at(env, monkeypatch):
+    monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 12345)
+    _, _, log = run(compaction_script(), env)
+    assert next(r["compaction"] for r in log_rows(log) if "compaction" in r)["compact_at"] == 12345
+
+def amnesia_log(tmp_path, steps):
+    """steps: [("edit"|"read_file"|"write_file"|"bash"|"COMPACT", path_or_cmd, old_string)]；edit 一律成功。"""
+    rows, n = [], 0
+    for st in steps:
+        if st[0] == "COMPACT":
+            rows.append({"turn": n, "compaction": {"before_tokens": 1, "summary": "s", "user_texts": []}})
+            continue
+        n += 1
+        inp = {"command": st[1]} if st[0] == "bash" else {"path": st[1], **({"old_string": st[2], "new_string": "n"} if st[0] == "edit" else {})}
+        rows.append({"turn": n, "response": {"content": [{"type": "tool_use", "id": f"t{n}", "name": st[0], "input": inp}]}})
+        rows.append({"turn": n, "tool_result": {"id": f"t{n}", "tool": st[0], "is_error": False, "content": "ok"}})
+    p = tmp_path / "am.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    return p
+
+def test_forgot_after_compaction(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    # (a) 壓縮後 read F 再 edit F：不是失憶
+    a = summarize_log.forgot_after_compaction(amnesia_log(tmp_path, [("edit", "F.py", "x"), ("COMPACT",), ("read_file", "F.py"), ("edit", "F.py", "y")]))
+    assert a["reread"] == [] and a["dup"] == []
+    # (b) 壓縮後只 read F、沒再 edit：疑似失憶
+    b = summarize_log.forgot_after_compaction(amnesia_log(tmp_path, [("edit", "F.py", "x"), ("COMPACT",), ("read_file", "F.py")]))
+    assert b["reread"] == ["F.py"]
+    # 沒改過的檔案、壓縮前的讀取都不算
+    c = summarize_log.forgot_after_compaction(amnesia_log(tmp_path, [("read_file", "F.py"), ("edit", "G.py", "x"), ("COMPACT",), ("read_file", "F.py")]))
+    assert c["reread"] == []
+    # 重複編輯、write_file、bash cat
+    d = summarize_log.forgot_after_compaction(amnesia_log(tmp_path, [("edit", "F.py", "same"), ("COMPACT",), ("edit", "F.py", "same"),
+                                                                    ("write_file", "F.py"), ("bash", "cat F.py")]))
+    assert d["dup"] == ["F.py"] and d["other"] == ["write_file F.py", "bash F.py"]
+
+def test_summarize_tolerates_unknown_and_new_lines(tmp_path, capsys):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    rows = [{"turn": 1, "mystery": 1}, {"turn": 2, "compaction_failed": {"reason": "摘要回應 stop_reason=max_tokens"}},
+            {"turn": 2, "tool_result": {"id": "x", "tool": "bash", "is_error": False, "content": "ok"}}]
+    p = tmp_path / "u.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    summarize_log.main([str(p)])
+    out = capsys.readouterr().out
+    assert "compaction 失敗" in out and "max_tokens" in out

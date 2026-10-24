@@ -1,4 +1,4 @@
-"""v2 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層。不用框架、不用 SDK tool runner。"""
+"""v3 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層 + 上下文壓縮。不用框架、不用 SDK tool runner。"""
 import fnmatch, json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import anthropic   # import 本身不需要 key；client 在 main 才建立
 
 # 刻意不在這裡寫「工具被拒絕時要換方法」：v2 要觀察模型光靠 tool_result 的「被拒絕」回饋能不能自己調整。
+# v3 同理：刻意不提示「context 可能被壓縮」，要觀察光靠摘要本身夠不夠讓它接續。
 # 放在最上面，方便實驗：拿掉一段，看行為怎麼變。
 SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
 你有六個工具：read_file、write_file、edit、grep、glob、bash。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
@@ -17,7 +18,10 @@ SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
 # ==== 【harness 角色：設定】用環境變數決定模型、輪數上限、工作目錄，方便不改程式做實驗 ====
 MODEL = os.environ.get("MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("EFFORT", "medium")
-MAX_TURNS = int(os.environ.get("MAX_TURNS", "25"))   # 防模型卡在同一個錯誤無限重試
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "60"))   # 防模型卡在同一個錯誤無限重試；30 次以上工具呼叫的任務需要更多輪（v2 是 25）
+# 故意設低讓測驗觸發：fixture 的 context 只有約 6.8k 字元，要能觸發 2 次以上壓縮；真實 harness 會等到接近模型 context 上限才壓縮
+COMPACT_AT_TOKENS = int(os.environ.get("COMPACT_AT_TOKENS", "8000"))
+COMPACT_COOLDOWN_TURNS = 3   # 摘要失敗後這麼多輪不再自動重試；否則 usage 一直超標，每輪都多付一次失敗的摘要請求
 USE_FALLBACKS = os.environ.get("USE_FALLBACKS", "1") == "1"
 # bash 的 cwd 是這個丟棄式資料夾（bash 本身仍能用絕對路徑跑出去，見權限層的說明）；檔案類工具的路徑由權限層限制在這裡面
 WORKDIR = Path(os.environ.get("WORKDIR", "./sandbox")).resolve()
@@ -376,6 +380,106 @@ def close_dangling(messages):
             {"type": "tool_result", "tool_use_id": i, "content": "Error: 工具未執行（回應被截斷或中斷）",
              "is_error": True} for i in ids]})
 
+# ==== 【harness 角色：上下文管理（compaction）】歷史每輪都整段重送，會越來越長；超過門檻就把整段歷史換成「摘要＋使用者原文」 ====
+# 不採「清掉舊 tool_result」：歷史只能往後加（thinking 區塊綁定整段對話，改寫舊訊息可能讓它們失效而 400）。
+# 所以做法是整段換掉：新對話不含任何舊的 assistant/thinking 區塊。
+LAST_USAGE = None   # 最近一次回應的 usage；跨 run_turn 保留，/tokens 與壓縮判斷都看它
+COMPACT_COOLDOWN = 0   # 還要略過幾輪自動壓縮；/compact 手動不看它，/reset 清掉
+
+# 壓縮後那則 user 訊息由多個 text 區塊組成，靠固定前綴辨認。
+# 使用者原文一段一塊、逐字保留：下次壓縮時 user_texts 才能分得出「原文」與「上次的摘要」，摘要不會疊層、原文不會被改寫。
+HEADER_PREFIX = "【context 已壓縮】"
+USER_PREFIX = "【使用者原文】\n"
+SUMMARY_PREFIX = "【先前工作摘要】\n"
+
+SUMMARY_REQUEST = """【系統指示】請停止工作，不要呼叫任何工具，只輸出一份摘要，讓一個看不到上面歷史的 agent 能接著完成任務。請依序整理：
+1. 原始任務與使用者的所有要求
+2. 已完成的工作（列出已處理完的檔案）
+3. 目前檔案狀態
+4. 尚未完成的工作（列出剩下的檔案）
+5. 重要發現與踩過的錯誤（例如 python 指令不存在要用 python3）
+6. 下一步"""
+
+def needs_compaction(last_usage):
+    if last_usage is None:   # 假 client 或第一輪：沒有 usage 就沒有依據，不壓縮
+        return False
+    used = (getattr(last_usage, "input_tokens", 0) or 0) + (getattr(last_usage, "output_tokens", 0) or 0)
+    return used > COMPACT_AT_TOKENS
+
+def user_texts(messages):
+    # 只收使用者「打的字」（不含 tool_result），原樣保留：摘要由模型改寫，使用者的話不能被改寫。
+    # 上次壓縮留下的標頭與摘要要丟掉（摘要會被新的取代）；原文區塊去掉前綴還原
+    out = []
+    for m in messages:
+        if m["role"] != "user":
+            continue
+        if isinstance(m["content"], str):
+            out.append(m["content"])
+            continue
+        for b in m["content"]:
+            t = _field(b, "text")
+            if _field(b, "type") != "text" or t.startswith((HEADER_PREFIX, SUMMARY_PREFIX)):
+                continue
+            out.append(t.removeprefix(USER_PREFIX))
+    return out
+
+def _compact_failed(log, turn, reason):
+    # 失敗要退避，也要留 log：之後回頭看才知道為什麼那幾輪沒壓縮
+    global COMPACT_COOLDOWN
+    COMPACT_COOLDOWN = COMPACT_COOLDOWN_TURNS
+    print(f"[警告] {reason}，這次不壓縮")
+    with open(log, "a") as f:
+        f.write(json.dumps({"turn": turn, "compaction_failed": {"reason": reason}}, ensure_ascii=False) + "\n")
+    return False
+
+def compact(client, messages, log, turn=0):
+    """回傳是否真的壓縮了。只在「邊界」做：沒有未配對的 tool_use（尾端是 user，或是 end_turn 後的純文字 assistant），
+    否則摘要請求本身會是壞歷史。"""
+    if not messages:
+        return False
+    last = messages[-1]
+    instruction = {"type": "text", "text": SUMMARY_REQUEST}
+    # 淺拷貝＋把指示附加在拷貝上：不動到原 messages，失敗時歷史原封不動
+    if last["role"] == "user":
+        content = [{"type": "text", "text": last["content"]}] if isinstance(last["content"], str) else list(last["content"])
+        asked = messages[:-1] + [{"role": "user", "content": content + [instruction]}]
+    elif not any(_field(b, "type") == "tool_use" for b in last["content"]):   # /compact 在一輪結束後下，尾端是 assistant
+        asked = messages + [{"role": "user", "content": [instruction]}]
+    else:
+        return False
+    kwargs = build_request(asked)
+    # 歷史裡有 tool_use/tool_result 時 API 要求仍要定義 tools；用 none 禁止這次呼叫工具（opus-5-5 只禁止 any/tool，none 可用）
+    # system 與 tools 必須和主對話一模一樣：thinking 區塊的簽章綁定「system＋tools＋之前所有訊息」，
+    # 換掉 system 會被 API 以 400「bound to a different conversation」拒絕（v3 第一次真實測驗踩到）。
+    # 摘要指示只能「附加」在最後；tool_choice 不在綁定範圍內，可以改成 none。
+    kwargs.update(tool_choice={"type": "none"})
+    before = (getattr(LAST_USAGE, "input_tokens", 0) or 0) + (getattr(LAST_USAGE, "output_tokens", 0) or 0)
+    try:
+        response = client.beta.messages.create(**kwargs)
+    except anthropic.APIError as e:
+        return _compact_failed(log, turn, f"摘要請求失敗：{type(e).__name__}: {e}")
+    # 被 max_tokens 截斷的摘要會缺尾巴（通常正是「下一步」），拒絕的回應更不是摘要；寧可不壓縮
+    if response.stop_reason != "end_turn":
+        return _compact_failed(log, turn, f"摘要回應 stop_reason={response.stop_reason}")
+    summary = "".join(b.text for b in response.content if b.type == "text").strip()
+    if not summary:
+        return _compact_failed(log, turn, "摘要回應沒有文字")
+    texts = user_texts(messages)
+    n_before = len(messages)
+    # 原地替換：REPL 持有的是同一個 list，換內容才會一起更新
+    blocks = [HEADER_PREFIX + "以下是使用者的原始要求（逐字原文）與先前工作的摘要。"]
+    blocks += [USER_PREFIX + t for t in texts]
+    blocks.append(f"{SUMMARY_PREFIX}{summary}\n\n請接著完成任務。")
+    messages[:] = [{"role": "user", "content": [{"type": "text", "text": t} for t in blocks]}]
+    # 摘要請求併進同一行 log（不另寫 request/response）；summary_usage 留著，統計 token 峰值時才不會漏掉它
+    usage = getattr(response, "usage", None)
+    with open(log, "a") as f:
+        line = {"turn": turn, "compaction": {"before_tokens": before, "messages_before": n_before, "summary": summary,
+                "compact_at": COMPACT_AT_TOKENS, "user_texts": texts, "summary_usage": usage.model_dump(mode="json") if usage else None}}
+        f.write(json.dumps(line, ensure_ascii=False, default=to_jsonable) + "\n")
+    print(f"🗜 context 壓縮：{before} tokens → 摘要 {len(summary)} 字")
+    return True
+
 def run_turn(client, messages, log):
     try:
         _loop(client, messages, log)
@@ -383,7 +487,12 @@ def run_turn(client, messages, log):
         close_dangling(messages)   # return、例外、Ctrl-C 都會經過這裡
 
 def _loop(client, messages, log):
+    global LAST_USAGE, COMPACT_COOLDOWN
     for turn in range(1, MAX_TURNS + 1):
+        if COMPACT_COOLDOWN > 0:
+            COMPACT_COOLDOWN -= 1
+        elif needs_compaction(LAST_USAGE) and compact(client, messages, log, turn):
+            LAST_USAGE = None   # 歷史換過了，舊的 usage 不代表現在的長度
         kwargs = build_request(messages)
         request = {k: kwargs[k] for k in ("model", "system", "tools", "messages")}
         try:
@@ -401,6 +510,7 @@ def _loop(client, messages, log):
             else:   # 429／529／網路錯誤：印出後回 REPL，歷史尾端是 user，下一句可併進去
                 print(f"[API 錯誤] {type(e).__name__}: {e}")
             return
+        LAST_USAGE = getattr(response, "usage", None)   # 假 client 的回應可能沒有 usage
         with open(log, "a") as f:
             line = {"turn": turn, "request": request,
                     "response": response.model_dump(mode="json")}
@@ -434,12 +544,15 @@ def _loop(client, messages, log):
                     rejected = block.name if refusal else None
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
-                if refusal:
-                    results.append({"type": "tool_result", "tool_use_id": block.id, **refusal})
-                    continue
-                result = execute_tool(block.name, block.input)
-                print(f"  {result['content'][:200]}")
+                result = refusal or execute_tool(block.name, block.input)
+                if not refusal:
+                    print(f"  {result['content'][:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, **result})
+                # 「記錄一切」：壓縮會換掉歷史，之後只有這行能查到哪些操作成功過（request 裡的 tool_result 已被摘要取代）
+                with open(log, "a") as f:
+                    f.write(json.dumps({"turn": turn, "tool_result": {"id": block.id, "tool": block.name,
+                            "is_error": bool(result.get("is_error")), "content": str(result["content"])[:300]}},
+                            ensure_ascii=False) + "\n")
             messages.append({"role": "user", "content": results})
         elif reason == "end_turn":
             return
@@ -488,6 +601,9 @@ def main():
         sys.exit(1)
     client = anthropic.Anthropic()   # 在這裡才建立，沒有 API key 時 import agent 不會爆
     log, messages = new_log_path(), []
+    global LAST_USAGE, COMPACT_COOLDOWN
+    LAST_USAGE = None
+    COMPACT_COOLDOWN = 0
     if len(sys.argv) > 1:
         add_user_text(messages, " ".join(sys.argv[1:]))
         try:
@@ -506,6 +622,18 @@ def main():
             break
         if text == "/reset":
             messages.clear()
+            LAST_USAGE = None
+            COMPACT_COOLDOWN = 0
+            continue
+        if text == "/compact":   # 手動觸發，不管門檻
+            if compact(client, messages, log):
+                LAST_USAGE = None
+            else:
+                print("沒有壓縮（歷史是空的、尾端有未配對的 tool_use，或摘要失敗）")
+            continue
+        if text == "/tokens":
+            u = LAST_USAGE
+            print(f"最近一次回應：input={u.input_tokens} output={u.output_tokens}" if u else "還沒有 usage 紀錄")
             continue
         if text:
             add_user_text(messages, text)

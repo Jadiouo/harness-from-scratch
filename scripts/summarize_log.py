@@ -129,11 +129,96 @@ def judge_v2(path):
                 f"拒絕後仍被處理: {leaked}" if leaked else ""))
     return res
 
+# ==== v3：上下文管理判定。log 裡有 compaction 行（agent.py 的 compact 寫的），夾在各輪 response 之間 ====
+def judge_v3(path, repo, fixture, compact_at):
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    calls, errors = load_calls(path)
+    events = []   # 依序：("resp", 回應), ("compact", compaction 記錄)
+    for d in rows:
+        if "response" in d:
+            events.append(("resp", d["response"]))
+        elif "compaction" in d:
+            events.append(("compact", d["compaction"]))
+    res = []
+    res.append((len(calls) >= 30, f"1. 工具呼叫總數 >= 30（實際 {len(calls)}）", ""))
+    n_comp = sum(1 for k, _ in events if k == "compact")
+    res.append((n_comp >= 1, f"2. 至少發生 1 次 compaction（實際 {n_comp}）", ""))
+    last = max((i for i, (k, _) in enumerate(events) if k == "compact"), default=None)
+    after = sum(1 for k, r in events[last + 1:] if k == "resp" for b in r.get("content", []) if b.get("type") == "tool_use") if last is not None else 0
+    res.append((after >= 1, f"3. 最後一次 compaction 之後模型還有工具呼叫（實際 {after} 次）", ""))
+    if repo.is_dir():
+        r = subprocess.run(["python3", "check_docstrings.py"], cwd=repo, capture_output=True,
+                           text=True, timeout=60, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        ok4 = "ALL OK" in r.stdout
+        detail4 = "" if ok4 else (r.stdout + r.stderr).strip()[:300]
+    else:
+        ok4, detail4 = False, f"{repo} 不存在"
+    a, b = repo / "check_docstrings.py", fixture / "check_docstrings.py"
+    same = a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+    res.append((ok4 and same, f"4. check_docstrings.py 輸出 ALL OK 且與 fixture 相同（ALL OK={ok4}，相同={same}）", detail4))
+    # 5. context 有界：峰值含摘要請求本身（它比前一個請求還大）；壓縮前後各取相鄰回應的 input_tokens
+    peaks = [(r.get("usage") or {}).get("input_tokens", 0) for k, r in events if k == "resp"]
+    peaks += [(c.get("summary_usage") or {}).get("input_tokens", 0) for k, c in events if k == "compact"]
+    peak = max(peaks, default=0)
+    # 優先用 log 記錄的門檻（agent.py 壓縮時寫入），沒有才用參數
+    logged = next((c["compact_at"] for k, c in reversed(events) if k == "compact" and c.get("compact_at")), None)
+    compact_at, src = (logged, "log") if logged else (compact_at, "參數")
+    ba, resp_in = [], [(i, (r.get("usage") or {}).get("input_tokens", 0)) for i, (k, r) in enumerate(events) if k == "resp"]
+    for i, (k, _) in enumerate(events):
+        if k == "compact":
+            b4 = [v for j, v in resp_in if j < i][-1:]
+            af = [v for j, v in resp_in if j > i][:1]
+            ba.append(f"壓縮前 {b4[0] if b4 else '?'} → 壓縮後 {af[0] if af else '?'}")
+    res.append((peak <= compact_at * 2, f"5. context 有界：input_tokens 峰值 {peak} <= 門檻 {compact_at}（{src}）x 2",
+                "每次 compaction：" + "；".join(ba) if ba else ""))
+    return res
+
+def forgot_after_compaction(path):
+    """6（觀察，不判 FAIL；都是近似判斷）。以 tool_result 行判斷 edit 是否成功（壓縮後 request 裡的結果已被換掉）。
+    reread：壓縮前已成功 edit 過 F、壓縮後又 read_file F，而且之後沒再成功 edit F（只是重讀確認，代表不確定 F 做完沒）。
+    dup：壓縮後的 edit，其 old_string 與壓縮前成功 edit 過的同檔 old_string 相同或互相包含（重複編輯）。
+    other：壓縮後對這些已改檔案用 write_file，或用含 cat 的 bash 指令存取。"""
+    _, errors = load_calls(path)   # 舊 log 沒有 tool_result 行時的後備
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    for d in rows:
+        if "tool_result" in d:
+            errors[d["tool_result"]["id"]] = bool(d["tool_result"].get("is_error"))
+    ev, ncomp = [], 0   # (序號, 壓縮次數, 工具呼叫)
+    for d in rows:
+        if "compaction" in d:
+            ncomp += 1
+        for b in d.get("response", {}).get("content", []):
+            if b.get("type") == "tool_use":
+                ev.append((ncomp, b))
+    rel = lambda b: posixpath.normpath(str(b["input"].get("path") or "")).removeprefix("sandbox/")
+    ok_edit = lambda b: b["name"] == "edit" and errors.get(b["id"]) is False
+    reread, dup, other = [], [], []
+    for i, (c, b) in enumerate(ev):
+        if c == 0:
+            continue
+        before = [x for cc, x in ev if cc < c and ok_edit(x)]   # 最近一次壓縮之前成功的 edit
+        done = {rel(x) for x in before}
+        if b["name"] == "read_file" and rel(b) in done and not any(ok_edit(x) and rel(x) == rel(b) for _, x in ev[i + 1:]):
+            reread.append(rel(b))
+        elif b["name"] == "edit":
+            old = str(b["input"].get("old_string") or "")
+            if old and any(rel(x) == rel(b) and (old in x["input"].get("old_string", "") or x["input"].get("old_string", "") in old) for x in before):
+                dup.append(rel(b))
+        elif b["name"] == "write_file" and rel(b) in done:
+            other.append(f"write_file {rel(b)}")
+        elif b["name"] == "bash" and "cat" in b["input"].get("command", ""):
+            cmd = b["input"]["command"]
+            other += [f"bash {f}" for f in sorted(done) if f in cmd or f.split("/", 1)[-1] in cmd]
+    return {"reread": reread, "dup": dup, "other": other}
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("log", nargs="?")
     ap.add_argument("--repo", default="sandbox/mini_repo")
     ap.add_argument("--fixture", default="fixtures/mini_repo")
+    ap.add_argument("--v3-repo", default="sandbox/docstring_repo")
+    ap.add_argument("--v3-fixture", default="fixtures/docstring_repo")
+    ap.add_argument("--compact-at", type=int, default=8000)   # 後備：新 log 的 compaction 行有 compact_at，舊 log 才用這個，要和跑測驗時的 COMPACT_AT_TOKENS 一致
     args = ap.parse_args(argv)
     path = Path(args.log) if args.log else latest_log()
     repo, fixture = (Path(p) if Path(p).is_absolute() else ROOT / p for p in (args.repo, args.fixture))
@@ -146,6 +231,19 @@ def main(argv):
         if "permission" in d:
             p, has_perm = d["permission"], True
             print(f"    [{p['decision']}{'→' + p['answer'] if p.get('answer') else ''} {p['tool']} {brief(p.get('input', {}))}]")
+            continue
+        if "tool_result" in d:   # 只供判定使用，不印
+            continue
+        if "compaction_failed" in d:
+            print(f"    ⚠ compaction 失敗（#{d.get('turn')}）：{d['compaction_failed'].get('reason')}")
+            continue
+        if "compaction" in d:
+            c = d["compaction"]
+            su = c.get("summary_usage") or {}
+            tin += su.get("input_tokens", 0); tout += su.get("output_tokens", 0)
+            print(f"    🗜 compaction：{c['before_tokens']} → 摘要 {len(c['summary'])} 字")
+            continue
+        if "response" not in d and "error" not in d:   # 不認得的行種類：略過，不崩
             continue
         if "error" in d:
             print(f"#{d['turn']} ERROR {d['error']['type']}: {d['error']['message']}")
@@ -181,6 +279,21 @@ def main(argv):
             if detail:
                 print("    " + detail.replace("\n", "\n    "))
         print("結果:", "全部通過" if all(ok for ok, _, _ in res2) else "有未通過項目")
+    if "docstring_repo" in path.read_text():   # v3 判定不受下面 v1 防呆影響
+        print("--- v3 完成標準判定 ---")
+        v3repo, v3fx = (Path(p) if Path(p).is_absolute() else ROOT / p for p in (args.v3_repo, args.v3_fixture))
+        res3 = judge_v3(path, v3repo, v3fx, args.compact_at)
+        for ok, label, detail in res3:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        fg = forgot_after_compaction(path)
+        print(f"觀察（不判 FAIL）：6. 壓縮後又 read_file 壓縮前已 edit 成功、之後沒再 edit 的檔案（疑似失憶）{len(fg['reread'])} 次" + "".join(f"\n    {f}" for f in fg["reread"]))
+        print(f"    重複編輯（old_string 在壓縮前同檔已成功 edit 過；近似判斷）{len(fg['dup'])} 次" + "".join(f"\n        {f}" for f in fg["dup"]))
+        print(f"    壓縮後對已改檔案的 write_file／bash cat 存取（近似判斷）{len(fg['other'])} 次" + "".join(f"\n        {f}" for f in fg["other"]))
+        print("結果:", "全部通過" if all(ok for ok, _, _ in res3) else "有未通過項目")
+        if not any("mini_repo" in str(v) for c in calls for v in c.get("input", {}).values()):
+            return res3
     # 沒成功呼叫 API 時不會有新 log，latest_log() 會默默撿到舊任務的 log，判定結果看似有效但不是這次的
     if repo.is_dir() and repo.stat().st_mtime > path.stat().st_mtime:
         print(f"⚠ 最新的 log（{path.name}）比 repo 的複製時間還舊——這次執行可能沒有成功呼叫 API，請看終端機輸出（v1 判定略過）")

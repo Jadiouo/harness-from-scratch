@@ -84,3 +84,35 @@
 - 被拒絕後沒有重試，改為列出修改對照表並等待確認；且主動指出「同批的 check.py 已經被改了，reports.py 沒改，所以現在不一致，可以幫你改回去」。
 - 新發現的 harness 問題：同一則回應裡的多個 tool_use 是互相依賴的計畫，權限層卻逐一獨立詢問 → 拒絕第 1 個、核准第 2 個，造成半套狀態。候選修法：同批中有一個被拒絕，後面的自動以「同批前一個操作被拒絕，未執行」回覆（Claude Code 的拒絕也會中止該回合，待確認細節）。未定，待使用者決定。
 - 採納（使用者選 1）：同批連帶略過——同一則回應中第一個被拒絕（n 或 deny）之後的 tool_use 不詢問、不執行，回 is_error「同批前面的 X 被拒絕」，log decision="skipped"；拒絕前已執行的保留真實結果（不回滾）。summarize_log 加第 5 項判定，對修改前錄的 v2-run2-reject.jsonl 正確判 FAIL。pytest `126 passed`。純 harness 邏輯，離線測試即可驗證，未再跑真實 API。
+
+## 2026-10-24 — v3（上下文管理）
+
+- 使用者決定：測驗用 claude-opus-5-5（費用不在意）。
+- 設計：
+  - 自寫 compaction：上一輪 input+output tokens > COMPACT_AT_TOKENS（預設 20000，刻意設低讓測驗觸發）時，在邊界（最後一則是 user、tool_use 已配對）另呼叫一次 API 產生摘要（tools 照帶、tool_choice none），再把整段歷史原地換成「使用者原文＋摘要」一則 user 訊息。
+  - 不採「清掉舊 tool_result」：違反 append-only，會讓 thinking 區塊失效（部分帳號 400）並破壞 prompt cache 前綴。
+  - 不用 API 伺服器端 compaction：學習目的要自己寫，只在文件比較。
+  - 刻意不在 system prompt 提示「context 可能被壓縮」（觀察摘要本身是否足夠接續）。
+  - MAX_TURNS 預設 25 → 60。
+  - 測驗 fixture：docstring_repo（約 25 檔、50–70 個函式，補 docstring），check_docstrings.py 驗證全數有 docstring 且函式數不變。
+
+### v3 審查第 1 輪（指揮官自讀＋白方）
+- 驗證：pytest `145 passed`（假 client）。
+- 採納：
+  1. fixture 太小（6.8k 字元），20k 門檻可能不觸發壓縮 → 門檻降 8000，compaction log 記錄門檻供判定使用。
+  2. 連續壓縮時 user_texts 把前次壓縮訊息當原文、摘要疊層（已重現）→ 壓縮訊息分塊（標頭／逐段使用者原文／摘要），以固定前綴辨識。
+  3. 摘要被 max_tokens 截斷或 refusal 仍被採用 → 檢查 stop_reason；失敗後冷卻 3 輪。
+  4. 失憶偵測不準，根因是 log 沒記工具結果（壓縮後查不到）→ 每個 tool_result 寫 log；失憶定義改為「壓縮後重讀已改檔且之後沒再改」。
+- 確認無問題：tool_choice none 與 fallbacks 相容（SDK 有型別，推論未實打）；SESSION_ALLOW 壓縮後仍有效；壓縮在邊界做、失敗時歷史不變。
+
+### v3 真實測驗第 1 次（logs/v3-run1-bindfail.jsonl）— 未通過，兩個原因
+- **摘要請求 400**：`Invalid signature in thinking block. The block is bound to a different conversation ... The system prompt differs`。官方文件（claude-api skill shared/model-migration.md「Breaking change 3」）：thinking 簽章綁定 top-level system＋tools＋之前所有訊息；tool_choice、max_tokens 等不在綁定範圍。修：摘要請求沿用 SYSTEM_PROMPT 與 TOOLS（刪掉 SUMMARIZER_SYSTEM），只附加摘要指示、tool_choice none。我們的整段替換屬文件推薦的「simple compaction」形狀。冷卻機制如設計運作（失敗後未每輪重試）。pytest `154 passed`。
+- **測驗被繞過**：模型讀完 24 檔後，用一次 bash heredoc 在 /tmp 寫 Python 腳本批次插入全部 docstring（使用者回 a 核准）→ 工具呼叫 29 次、ALL OK，但 v3 要測的長任務沒出現。修：任務句加「請用 edit 工具一個函式一個函式修改，不要寫腳本批次處理」。
+- 觀察：腳本寫到 /tmp（WORKDIR 外）——權限層有詢問（含 heredoc 判 ask），是人核准的；顯示「a＝這條完全相同的指令」在長指令上等同一次性的 y，核准者要讀內容。
+
+### v3 真實測驗第 2 次（logs/v3-run2-pass.jsonl）— v3 完成標準通過
+- 5 項全 PASS：16 輪、91 次工具呼叫（edit 56、read_file 31）、壓縮 4 次，input_tokens 峰值 11,313，每次壓縮後回到約 3.7k–4.1k；ALL OK；失憶偵測 0。總 tokens 148k（估約 0.9 美元）。
+- 觀察（未修，候選改進）：
+  - **壓縮時機吃掉剛讀的內容**：第 4 輪讀了 6 個 geometry 檔 → 壓縮 → 第 5 輪原樣重讀同 6 檔；第 14 輪跑 check → 壓縮 → 第 15 輪重跑。原因：壓縮發生在 tool_result 剛回來之後，摘要裝不下檔案內容。可能改法：保留最後一輪的 tool_result（需剝掉被保留輪的 thinking，見 keep-tail 規則）、或在讀檔前預估觸發。
+  - 模型自動改成「一批讀 6 檔→一批改」的節奏，剛好和壓縮週期對齊。
+  - v2 判定區塊在沒有任何 n 時也印出 FAIL，屬顯示問題（只該在有拒絕時判定）。
