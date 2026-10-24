@@ -158,3 +158,29 @@
 - 每次壓縮後第一個動作都是 todo_write 更新清單，接著直接做下一個資料夾。
 - read_file 31 → 25：本次壓縮後**沒有重讀**（run1 有 1 次 6 檔重讀）。注意（推論）：本次壓縮都落在 edit 批次之後、而非剛讀完檔時，重讀減少可能主要來自壓縮時機不同，不能全歸功於清單；各 1 次樣本。
 - 對照結論：只靠工具描述 → 0 次使用；system prompt 加一句 → 規劃、更新、壓縮後接續都出現。與 v1「改工具描述比改程式有效」對照：這次是工具描述不夠、要 system prompt。
+
+## v4-3 subagent（task 工具）
+- 設計（定案）：task(description, prompt) → harness 開全新對話（SUBAGENT_SYSTEM、SUB_TOOLS＝read_file/grep/glob），最多 20 輪、不壓縮、不能再呼叫 task；只把最後文字回給主對話。sub 的 usage 不碰 LAST_USAGE。log 同檔，sub 行帶 agent=sub、sub_id；summarize_log 既有判定只看主對話行。system prompt 加一句 task 使用時機（記取 TODO 實驗教訓）。
+- 實驗題：盤點 mini_repo 折扣函式與呼叫關係；標準答案 fixtures/subagent_answer.md（關鍵：loyalty_bonus 無人呼叫；bulk_restock 是進貨成本）。指揮官 grep 核對無誤。
+
+### v4-3 審查第 1 輪（sonnet，乾淨上下文）
+- 驗證：pytest `235 passed`。
+- 必改：無（隔離、安全、配對皆確認）。
+- 建議採納：subagent API 例外原本 return 離開 _loop，同批已執行的 write_file 結果被丟、close_dangling 誤標「未執行」→ 改成 task 的 is_error 結果、同批繼續；有 sub 行時 v3 照跑、v1 略過並說明；summarize_log exit code 在 FAIL 時沒反映（既有問題）→ 修；chars 是截斷後長度，文件改口徑；兩個空洞測試補強；補「被拒絕在前、task 在後 → 略過」測試。
+- 不採納：mini_repo 太小、grep 兩次就能解——刻意保留（答案可客觀核對；比的是主對話 context 有沒有被灌，不是 subagent 是否必要），已寫進文件。
+- 修正後驗證：pytest `239 passed`；舊 log 跑 summarize_log 正常。進真實測驗。
+
+### v4-3 真實測驗（logs/v4-sub-run-task.jsonl vs logs/v4-sub-run-control.jsonl）— 通過（HANDOFF v4 完成標準）
+| | 實驗組（task） | 對照組（自己搜） |
+|---|---|---|
+| 主對話輪數 | 2 | 7 |
+| 主對話 input 峰值 | 6,026 | 10,164（因此觸發 1 次壓縮） |
+| 主對話自己的工具呼叫 | task×1，之後 0 次重做搜尋 | glob 2、grep 5、read_file 4 |
+| subagent | 8 輪、read 13/glob 3/grep 2，in=53k | — |
+| 回給主對話 / sub 收到的工具結果 | 2,638 / 18,830 字元（14%） | — |
+| 總 tokens | 主 11k＋sub 56k ≈ 67k | 56k |
+| 答案 | 正確（loyalty_bonus 無人呼叫、bulk_restock 非銷售折扣、加分項 unit_price_after） | 同樣正確 |
+- 結論：主對話 context 保持乾淨（峰值低 4 成、不用壓縮），答案品質沒掉；總花費反而多約 2 成——subagent 省的是主對話 context，不是錢。
+- 兩組都發現任務句寫錯路徑（WORKDIR 裡是 mini_repo/ 不是 sandbox/mini_repo），自行修正並在回答中說明。
+- summarize_log 誤判（真實踩到）：實驗組 log 印了 v3 判定且第 4 項顯示 ALL OK——v3 的開關原本是「整份 log 文字含 docstring_repo」，subagent 的 glob(**/*) 輸出含這個字；第 4 項又是讀 sandbox 現況而非 log。修：改看主對話的任務句（first_task_text）。pytest `240 passed`（含新測試）。
+- 已知限制（未修）：v3 第 4 項讀 sandbox 現況，事後換過 sandbox 再判舊 log 會不準。

@@ -1,4 +1,5 @@
 """把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1／v2／v3／v4 完成標準。
+subagent 的 log 行（帶 "agent": "sub"）不進任何既有判定與每輪摘要，只給 v4-subagent 判定用；舊 log 沒有這個欄位，一律視為主對話。
 用法：summarize_log.py [log路徑] [--repo sandbox/mini_repo] [--fixture fixtures/mini_repo]"""
 import argparse, difflib, json, os, posixpath, re, subprocess, sys
 from collections import Counter
@@ -12,6 +13,21 @@ def latest_log():
         sys.exit("logs/ 裡沒有 log")
     return logs[-1]   # 檔名是時間戳，字典序最後就是最新
 
+def read_rows(path, sub=False):
+    # 同一個 log 檔混著主對話與 subagent 的行。預設只回主對話：subagent 的 system/tools/usage 和主對話不同，
+    # 混進來會讓「system 凍結」「token 峰值」這類既有判定被汙染
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    return [d for d in rows if (d.get("agent") == "sub") == sub]
+
+def first_task_text(path):
+    # 主對話第一個 request 的第一則 user 訊息＝使用者的任務句
+    for d in read_rows(path):
+        msgs = d.get("request", {}).get("messages") or []
+        if msgs:
+            c = msgs[0].get("content", "")
+            return c if isinstance(c, str) else " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
+
 def brief(inp):
     # 主要參數：command / pattern / path 擇一，前 60 字元
     if isinstance(inp.get("todos"), list):   # todo_write：顯示項數就好
@@ -22,8 +38,7 @@ def brief(inp):
 # ==== 讀 log：依序取出工具呼叫，並從下一輪 request 的 messages 找回每個呼叫的結果 ====
 def load_calls(path):
     calls, errors, seen = [], {}, set()
-    for line in path.read_text().splitlines():
-        d = json.loads(line)
+    for d in read_rows(path):
         for m in d.get("request", {}).get("messages", []):   # permission 行沒有 request
             if isinstance(m.get("content"), list):
                 for b in m["content"]:
@@ -99,7 +114,7 @@ def strings(inp):
 
 # ==== v2：權限層判定。拒絕 = 使用者回 n，或權限層 deny（skipped 是連帶略過，不算拒絕）====
 def judge_v2(path):
-    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    rows = read_rows(path)
     perms = {d["permission"].get("id"): d["permission"] for d in rows if "permission" in d}
     seq, texts = [], []   # seq: (tool_use, 它所在回應的序號)；texts: 每個回應裡的 text
     for d in rows:
@@ -133,7 +148,7 @@ def judge_v2(path):
 
 # ==== v3：上下文管理判定。log 裡有 compaction 行（agent.py 的 compact 寫的），夾在各輪 response 之間 ====
 def judge_v3(path, repo, fixture, compact_at):
-    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    rows = read_rows(path)
     calls, errors = load_calls(path)
     events = []   # 依序：("resp", 回應), ("compact", compaction 記錄)
     for d in rows:
@@ -180,7 +195,7 @@ MEMORY_MARK = "# 專案記憶"
 BARE_PYTHON = re.compile(r"(?<![\w./-])python(?![\w.-])")   # 單獨的 python；python3、/usr/bin/python3 不算
 
 def judge_v4(path):
-    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    rows = read_rows(path)
     systems = [d["request"]["system"] for d in rows if "system" in d.get("request", {})]
     if not systems or MEMORY_MARK not in str(systems[0]):
         return None
@@ -204,7 +219,7 @@ def judge_v4(path):
 
 # ==== v4-TODO：只在 log 有 todo_write 時判定。前三項看行為，第四項看 harness 有沒有把清單帶進壓縮 ====
 def judge_todo(path):
-    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    rows = read_rows(path)
     # 只採計成功的 todo_write：失敗（格式錯）或被同批拒絕略過的呼叫沒有改到 TODOS，算進去會誤判模型有在維護清單
     _, errors = load_calls(path)
     for d in rows:
@@ -253,7 +268,7 @@ def forgot_after_compaction(path):
     dup：壓縮後的 edit，其 old_string 與壓縮前成功 edit 過的同檔 old_string 相同或互相包含（重複編輯）。
     other：壓縮後對這些已改檔案用 write_file，或用含 cat 的 bash 指令存取。"""
     _, errors = load_calls(path)   # 舊 log 沒有 tool_result 行時的後備
-    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    rows = read_rows(path)
     for d in rows:
         if "tool_result" in d:
             errors[d["tool_result"]["id"]] = bool(d["tool_result"].get("is_error"))
@@ -285,6 +300,56 @@ def forgot_after_compaction(path):
             other += [f"bash {f}" for f in sorted(done) if f in cmd or f.split("/", 1)[-1] in cmd]
     return {"reread": reread, "dup": dup, "other": other}
 
+# ==== v4-subagent：log 裡帶 "agent": "sub" 的行 ====
+SEARCH_TOOLS = ("grep", "glob", "read_file")
+
+def print_sub(rows):
+    if not rows:
+        return
+    calls, turns, tin, tout = [], 0, 0, 0
+    for d in rows:
+        r = d.get("response")
+        if r:
+            turns += 1
+            tin += (r.get("usage") or {}).get("input_tokens", 0)
+            tout += (r.get("usage") or {}).get("output_tokens", 0)
+            calls += [f"{b['name']}({brief(b.get('input', {}))})" for b in r.get("content", []) if b.get("type") == "tool_use"]
+    print(f"    ↳ sub#{rows[0].get('sub_id')}：{turns} 輪 in={tin} out={tout} | {'; '.join(calls) or '(無工具呼叫)'}")
+
+def _chars(tr):
+    return tr.get("chars", len(str(tr.get("content", ""))))   # 舊格式沒有 chars，content 又被截成 300，只能近似
+
+def judge_subagent(path):
+    """沒有 sub 行回 None。回傳 (判定, 觀察文字列表)。"""
+    sub = read_rows(path, sub=True)
+    if not sub:
+        return None
+    main = read_rows(path)
+    uses = [b for d in main for b in d.get("response", {}).get("content", []) if b.get("type") == "tool_use"]
+    n_task = sum(b["name"] == "task" for b in uses)
+    sub_uses = [b["name"] for d in sub for b in d.get("response", {}).get("content", []) if b.get("type") == "tool_use"]
+    back = sum(_chars(d["tool_result"]) for d in main if d.get("tool_result", {}).get("tool") == "task")
+    got = sum(_chars(d["tool_result"]) for d in sub if "tool_result" in d)
+    res = [(n_task >= 1, f"1. 主對話呼叫 task >= 1 次（實際 {n_task}）", ""),
+           (any(n in SEARCH_TOOLS for n in sub_uses), f"2. subagent 至少用過一次 grep/glob/read_file（實際 {Counter(sub_uses) or '無'}）", ""),
+           (got > 0 and back < got * 0.2, f"3. context 乾淨：task 回給主對話 {back} 字元 < subagent 收到的工具結果（截斷後）{got} 字元的 20%",
+            f"比例 {back / got:.1%}" if got else "subagent 沒有收到任何工具結果")]
+    peaks = [(d["response"].get("usage") or {}).get("input_tokens", 0) for d in main if "response" in d]
+    peaks += [(d["compaction"].get("summary_usage") or {}).get("input_tokens", 0) for d in main if "compaction" in d]
+    sub_in = sum((d["response"].get("usage") or {}).get("input_tokens", 0) for d in sub if "response" in d)
+    sub_out = sum((d["response"].get("usage") or {}).get("output_tokens", 0) for d in sub if "response" in d)
+    names = [b["name"] for b in uses]
+    first = names.index("task") if "task" in names else None
+    redo = [f"{b['name']}({brief(b.get('input', {}))})" for b in uses[first + 1:] if b["name"] in SEARCH_TOOLS] if first is not None else []
+    obs = [f"主對話 input_tokens 峰值：{max(peaks, default=0)}",
+           f"subagent 總 tokens：input={sub_in} output={sub_out}（花費照付，省的是主對話的 context）",
+           f"主對話在第一次 task 之後自己又 grep/glob/read_file（重做搜尋）：{len(redo)} 次" + "".join(f"\n        {r}" for r in redo)]
+    return res, obs
+
+def exit_code(res):
+    """任何判定 FAIL 回 1，否則 0（2 另表「log 不可用」）。以前直接回 res 這個 list，和 2 比較永遠不等，FAIL 也 exit 0。"""
+    return 0 if all(ok for ok, _, _ in res) else 1
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("log", nargs="?")
@@ -300,14 +365,20 @@ def main(argv):
     counts, seen, rewrites = Counter(), set(), []
     tin = tout = 0
     refused = False   # 有任何「使用者回 n」或 deny 才有 v2 可判定的東西
-    for line in path.read_text().splitlines():
-        d = json.loads(line)
+    subbuf = []   # subagent 的行先存著，等主對話的 task tool_result 行出現再縮排印在它下面
+    for d in (json.loads(l) for l in path.read_text().splitlines()):   # 這裡才要全部的行（主對話與 sub）
+        if d.get("agent") == "sub":
+            subbuf.append(d)
+            continue
         if "permission" in d:
             p = d["permission"]
             refused = refused or p.get("answer") == "n" or p.get("decision") == "deny"
             print(f"    [{p['decision']}{'→' + p['answer'] if p.get('answer') else ''} {p['tool']} {brief(p.get('input', {}))}]")
             continue
-        if "tool_result" in d:   # 只供判定使用，不印
+        if "tool_result" in d:   # 只供判定使用，不印；task 的例外：印它的 subagent 概要
+            if d["tool_result"].get("tool") == "task":
+                print_sub(subbuf)
+                subbuf = []
             continue
         if "compaction_failed" in d:
             print(f"    ⚠ compaction 失敗（#{d.get('turn')}）：{d['compaction_failed'].get('reason')}")
@@ -340,15 +411,18 @@ def main(argv):
                 seen.add(p)
         print(f"#{d['turn']} {r.get('stop_reason')} in={u.get('input_tokens', 0)} "
               f"out={u.get('output_tokens', 0)} | {'; '.join(calls) or '(無工具呼叫)'}")
+    print_sub(subbuf)   # 被中斷、沒有 tool_result 的 subagent
     print("--- 統計 ---")
     print("工具呼叫次數:", dict(counts) or "無")
     print(f"write_file 用在先前讀過／搜過的路徑（近似判斷）: {rewrites or '無'}")
     print(f"總 tokens: input={tin} output={tout} total={tin + tout}")
 
+    allres = []   # 所有判定的結果，結尾用來決定 exit code
     calls, errors = load_calls(path)
     if refused:   # v2 判定不受下面 v1 防呆影響；沒有拒絕時第 1、3 項必然 FAIL，印出來會誤導
         print("--- v2 完成標準判定 ---")
         res2 = judge_v2(path)
+        allres += res2
         for ok, label, detail in res2:
             print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
             if detail:
@@ -356,17 +430,20 @@ def main(argv):
         print("結果:", "全部通過" if all(ok for ok, _, _ in res2) else "有未通過項目")
     res4 = judge_v4(path)
     if res4:
+        allres += res4
         print("--- v4-記憶判定 ---")
         for ok, label, detail in res4:
             print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
             if detail:
                 print("    " + detail.replace("\n", "\n    "))
-        mem = next(d["request"]["system"] for l in path.read_text().splitlines() if "system" in (d := json.loads(l)).get("request", {}))
+        mem = next(d["request"]["system"] for d in read_rows(path) if "system" in d.get("request", {}))
         print("3. 載入的記憶（前 200 字）：" + mem.split(MEMORY_MARK, 1)[1].split("\n", 1)[-1][:200].replace("\n", " "))
         print("結果:", "全部通過" if all(ok for ok, _, _ in res4) else "有未通過項目")
+    res_sub = judge_subagent(path)
     res_todo = judge_todo(path)
     if res_todo:
         res, last, comps, n_todo = res_todo
+        allres += [r for r in res if "不適用" not in r[1]]
         print("--- v4-TODO 判定 ---")
         for ok, label, detail in res:
             print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
@@ -381,10 +458,23 @@ def main(argv):
         print("結果:", "全部通過" if all(ok for ok, l, _ in res if "不適用" not in l) else "有未通過項目")   # 不適用的項目不計入
     elif sum(counts.values()) > 10:
         print("⚠ 長任務但沒用 TODO 工具")
-    if "docstring_repo" in path.read_text():   # v3 判定不受下面 v1 防呆影響
+    if res_sub:
+        res, obs = res_sub
+        allres += res
+        print("--- v4-subagent 判定 ---")
+        for ok, label, detail in res:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        print("觀察（不判 PASS/FAIL）：4.")
+        print("".join(f"    {o}\n" for o in obs), end="")
+        print("結果:", "全部通過" if all(ok for ok, _, _ in res) else "有未通過項目")
+    # 只看使用者的任務句：整份 log 文字會含工具輸出（例如 subagent 的 glob 列出 docstring_repo），用它判斷會誤開 v3 判定
+    if "docstring_repo" in first_task_text(path):   # v3 判定不受下面 v1 防呆影響
         print("--- v3 完成標準判定 ---")
         v3repo, v3fx = (Path(p) if Path(p).is_absolute() else ROOT / p for p in (args.v3_repo, args.v3_fixture))
         res3 = judge_v3(path, v3repo, v3fx, args.compact_at)
+        allres += res3
         for ok, label, detail in res3:
             print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
             if detail:
@@ -395,7 +485,10 @@ def main(argv):
         print(f"    壓縮後對已改檔案的 write_file／bash cat 存取（近似判斷）{len(fg['other'])} 次" + "".join(f"\n        {f}" for f in fg["other"]))
         print("結果:", "全部通過" if all(ok for ok, _, _ in res3) else "有未通過項目")
         if not any("mini_repo" in str(v) for c in calls for v in c.get("input", {}).values()):
-            return res3
+            return exit_code(allres)
+    if res_sub:   # v3 判定只看主對話行，照跑；v1 是修 bug 判定，這類唯讀問答 log 不適用
+        print("（有 subagent 呼叫，略過 v1 判定：這類 log 是唯讀問答）")
+        return exit_code(allres)
     # 沒成功呼叫 API 時不會有新 log，latest_log() 會默默撿到舊任務的 log，判定結果看似有效但不是這次的
     if repo.is_dir() and repo.stat().st_mtime > path.stat().st_mtime:
         print(f"⚠ 最新的 log（{path.name}）比 repo 的複製時間還舊——這次執行可能沒有成功呼叫 API，請看終端機輸出（v1 判定略過）")
@@ -412,7 +505,7 @@ def main(argv):
     obs = [c["input"]["command"] for c in calls if c["name"] == "bash" and any(k in c["input"].get("command", "") for k in BYPASS)]
     print(f"觀察（不判 FAIL）：bash 繞過專用工具的指令 {len(obs)} 個" + "".join(f"\n    {o[:100]}" for o in obs))
     print("結果:", "全部通過" if all(ok for ok, _, _ in res) else "有未通過項目")
-    return res
+    return exit_code(allres + res)
 
 if __name__ == "__main__":
-    sys.exit(2 if main(sys.argv[1:]) == 2 else 0)
+    sys.exit(main(sys.argv[1:]))

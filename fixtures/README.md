@@ -52,3 +52,30 @@ rm -rf sandbox/docstring_repo && cp -r fixtures/docstring_repo sandbox/
 
 看 `summarize_log.py` 的「v4-TODO 判定」：先規劃再動手、更新 >= 3 次、最後全 completed、每次壓縮都帶 todos；另有壓縮後下一輪的工具呼叫與失憶偵測（對照 v3 同任務的 `reread` 次數）。
 預期（尚未實跑）：若模型沒用 TODO 工具，會印「⚠ 長任務但沒用 TODO 工具」——這本身就是實驗結果，代表只靠工具描述不夠，下一步才考慮在 system prompt 加說明。
+
+## v4-subagent 實驗（task 工具：主對話 context 有沒有保持乾淨）
+唯讀題目：盤點 mini_repo 裡跟折扣有關的函式與呼叫關係。標準答案在 `fixtures/subagent_answer.md`（sandbox 之外）。要看的是**同一題**分成兩組跑，比較主對話的 input_tokens 峰值與答案。
+
+```bash
+rm -rf sandbox/mini_repo && cp -r fixtures/mini_repo sandbox/
+# 實驗組
+.venv/bin/python agent.py "sandbox 裡的 mini_repo 想盤點「折扣」相關的程式。請列出所有跟銷售折扣計算有關的函式：各在哪個檔案、誰呼叫誰；另外指出有沒有「定義了但完全沒人呼叫」的折扣函式。只要回答，不要改任何檔案。請用 task 工具派 subagent 去搜尋，你自己不要直接讀檔或搜尋。"
+.venv/bin/python scripts/summarize_log.py
+mv "$(ls -t logs/*.jsonl | head -1)" logs/v4-sub-run-task.jsonl
+
+# 對照組（同一個 mini_repo，沒改過）
+.venv/bin/python agent.py "sandbox 裡的 mini_repo 想盤點「折扣」相關的程式。請列出所有跟銷售折扣計算有關的函式：各在哪個檔案、誰呼叫誰；另外指出有沒有「定義了但完全沒人呼叫」的折扣函式。只要回答，不要改任何檔案。不要使用 task 工具。"
+.venv/bin/python scripts/summarize_log.py
+```
+對照組沒有 sub 行，所以不會印 v4-subagent 判定；mini_repo 沒被修好，v1 判定會是 FAIL，這題不看它。
+
+看法：
+1. `summarize_log.py` 的「v4-subagent 判定」只在實驗組出現：呼叫 task、subagent 有搜尋、task 回傳字元數 < subagent 收到工具結果的 20%；下面「觀察」列主對話峰值 input_tokens、subagent 總 tokens、主對話在 task 之後有沒有自己又搜尋。
+2. 兩組都看每輪摘要的 `in=`：對照組的 input 會隨著讀檔一路長高；實驗組主對話只有少數幾輪、input 應該停在低檔。
+3. 兩組的最終答案都對照 `fixtures/subagent_answer.md`（尤其是 `loyalty_bonus` 沒人呼叫、`bulk_restock` 不是銷售折扣）。
+
+預期（尚未實跑）：
+- 實驗組：主對話約 2-3 輪（派 task、收結論、回報），input_tokens 峰值遠低於對照組；subagent 約 5-10 輪 grep/read_file；task 回傳約數百字元，比例遠低於 20%，判定 1-3 PASS；主對話之後不重做搜尋。
+- 對照組：主對話自己 grep/read_file，input_tokens 隨輪數增加，峰值高於實驗組。
+- 兩組答案都應包含 bulk/coupon/member/apply_discounts 與 `loyalty_bonus` 無人呼叫；subagent 若漏看 pricing/__init__.py 的 re-export，可能說不出 orders.py 怎麼呼叫，這是 subagent 只回結論的代價（細節遺失）。
+- 這個 repo 只有約 400 行，總 token 不一定省（subagent 的 token 照付）；要看的是主對話峰值。

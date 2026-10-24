@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 import json, sys
 from pathlib import Path
 import anthropic, httpx2, pytest
@@ -27,7 +28,7 @@ class FakeClient:
     def create(self, **kwargs):
         self.calls.append({**kwargs, "messages": list(kwargs["messages"])})   # 拷貝：loop 之後還會往原 list 加東西
         r = self.script.pop(0)
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):   # 含 KeyboardInterrupt
             raise r
         return r
 
@@ -43,6 +44,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.SYSTEM_PROMPT)   # main 會改它；測完還原，避免測試間污染
     monkeypatch.setattr(agent, "SESSION_MEMORY", None)
     monkeypatch.setattr(agent, "TODOS", [])
+    monkeypatch.setattr(agent, "SUB_COUNT", 0)
     monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)   # 預設值是給真實測驗用的 8000；單元測試用固定值
     return tmp_path
 
@@ -953,7 +955,7 @@ def v3_log(tmp_path, n_calls=32, compact_after=16, peak=24000, reread=None, comp
         name, inp = ("edit", {"path": path, "old_string": "a", "new_string": "b"})
         if reread and i == reread[0]:
             name, inp = "read_file", {"path": reread[1]}
-        rows.append({"turn": i, "request": {"messages": [{"role": "user", "content": results}] if results else []},
+        rows.append({"turn": i, "request": {"messages": [{"role": "user", "content": results}] if results else [{"role": "user", "content": "幫 docstring_repo 補 docstring"}]},
                      "response": {"stop_reason": "tool_use", "usage": {"input_tokens": peak if i == compact_after else 3000, "output_tokens": 5},
                                   "content": [{"type": "tool_use", "id": f"t{i}", "name": name, "input": inp}]}})
         results = results + [{"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}]
@@ -1484,3 +1486,333 @@ def test_todo_write_strips_whitespace_and_accepts_limits(env):
     assert "is_error" not in r and agent.TODOS == [td("a")]
     r = agent.execute_tool("todo_write", {"todos": [td("字" * 200) for _ in range(50)]})
     assert "is_error" not in r and len(agent.TODOS) == 50
+
+
+# ==== v4：subagent（task 工具）====
+class RoutedClient:
+    """依 system 分辨主對話與 subagent 的請求，各有自己的腳本與呼叫紀錄。"""
+    def __init__(self, main, sub):
+        self.main, self.sub = FakeClient(main), FakeClient(sub)
+        self.beta = self.messages = self
+    def create(self, **kw):
+        return (self.sub if kw["system"] == agent.SUBAGENT_SYSTEM else self.main).create(**kw)
+
+def task_call(id="k", prompt="找出所有折扣函式，回報檔案:行號"):
+    return tool(id, "task", description="找折扣函式", prompt=prompt)
+
+def run2(main, sub, env, messages=None, user="go"):
+    client, messages = RoutedClient(main, sub), messages if messages is not None else []
+    agent.add_user_text(messages, user)
+    log = agent.new_log_path()
+    agent.run_turn(client, messages, log)
+    return client, messages, log
+
+def sub_result(client, i=1):
+    """subagent 第 i+1 次請求裡，上一批工具的 tool_result 區塊。"""
+    return client.sub.calls[i]["messages"][-1]["content"]
+
+def test_task_runs_subagent_and_main_only_gets_conclusion(env):
+    put("shop.py", "def apply_discounts(): pass\n# 大量內容 SECRET-IN-FILE\n")
+    sub = [msg([tool("s1", "grep", pattern="discount")], "tool_use"),
+           msg([tool("s2", "read_file", path="shop.py")], "tool_use"),
+           msg([text("結論：apply_discounts 在 shop.py:1")], "end_turn")]
+    client, messages, _ = run2([msg([task_call()], "tool_use"), msg([text("好的，答案如上")], "end_turn")], sub, env)
+    assert len(client.sub.calls) == 3 and len(client.main.calls) == 2
+    assert messages[2]["content"][0]["content"] == "結論：apply_discounts 在 shop.py:1"
+    dumped = json.dumps(messages, default=agent.to_jsonable, ensure_ascii=False)
+    assert "SECRET-IN-FILE" not in dumped and "s1" not in dumped   # subagent 的工具結果與 id 不在主對話
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant"]
+    check_pairing(messages)
+
+def test_subagent_requests_use_own_system_and_fixed_tools(env):
+    sub = [msg([tool("s1", "glob", pattern="*")], "tool_use"), msg([text("完")], "end_turn")]
+    client, _, _ = run2([msg([task_call(prompt="P")], "tool_use"), msg([text("ok")], "end_turn")], sub, env)
+    for c in client.sub.calls:
+        assert c["system"] == agent.SUBAGENT_SYSTEM and c["tools"] == agent.SUB_TOOLS
+        assert [t["name"] for t in c["tools"]] == ["read_file", "grep", "glob"]
+        assert c["messages"][0] == {"role": "user", "content": "P"}   # 全新對話：第一則只有 prompt
+    assert client.sub.calls[0]["messages"] == [{"role": "user", "content": "P"}]
+    assert all(t in agent.TOOLS for t in agent.SUB_TOOLS)   # 同一份定義，不另寫
+    for c in client.main.calls:   # 主對話不受影響
+        assert c["system"] == agent.SESSION_SYSTEM != agent.SUBAGENT_SYSTEM and c["tools"] == agent.TOOLS
+    assert [t["name"] for t in agent.TOOLS][-1] == "task" and len(agent.TOOLS) == 8
+    k = client.sub.calls[0]   # 同 MODEL/EFFORT/fallbacks
+    assert k["model"] == agent.MODEL and k["output_config"] == {"effort": agent.EFFORT} and k["fallbacks"] == "default"
+
+def test_build_request_defaults_unchanged(env):
+    k = agent.build_request([])
+    assert k["system"] == agent.SESSION_SYSTEM and k["tools"] == agent.TOOLS
+
+def test_system_prompt_mentions_task_and_eight_tools():
+    assert "八個工具" in agent.SYSTEM_PROMPT and "task" in agent.SYSTEM_PROMPT and "七個" not in agent.SYSTEM_PROMPT
+
+def test_subagent_cannot_use_write_bash_or_task(env):
+    sub = [msg([tool("a", "write_file", path="x.txt", content="1"), tool("b", "bash", command="echo hi"),
+                tool("c", "task", description="d", prompt="p")], "tool_use"), msg([text("沒辦法")], "end_turn")]
+    client, messages, _ = run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], sub, env)
+    rs = sub_result(client)
+    assert [r["is_error"] for r in rs] == [True, True, True] and all("沒有" in r["content"] for r in rs)
+    assert not (agent.WORKDIR / "x.txt").exists() and agent.SUB_COUNT == 1   # 沒有遞迴：task 沒有再開 subagent
+    assert len(client.sub.calls) == 2 and messages[2]["content"][0]["content"] == "沒辦法"
+
+def test_subagent_path_outside_workdir_denied_without_prompt(ask_env):
+    asked = ask_env()   # 沒有任何答案：被問到就會 StopIteration
+    sub = [msg([tool("a", "read_file", path="../secret"), tool("b", "grep", pattern="x", path="/etc"),
+                tool("c", "glob", pattern="../*")], "tool_use"), msg([text("被擋")], "end_turn")]
+    client, _, _ = run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], sub, None)
+    rs = sub_result(client)
+    assert all(r["is_error"] and "權限層拒絕" in r["content"] for r in rs) and asked == []
+
+def test_subagent_treats_ask_as_denied_never_prompts(env, monkeypatch):
+    monkeypatch.setattr(agent, "check_permission", lambda name, args: ("ask", "假裝要問"))
+    monkeypatch.setattr(agent, "PROMPT", lambda q: pytest.fail("subagent 不能跳出 input"))
+    monkeypatch.setattr(agent, "ask_user", lambda *a: pytest.fail("subagent 不能問使用者"))
+    put("a.txt", "x")
+    sub = [msg([tool("a", "read_file", path="a.txt")], "tool_use"), msg([text("被拒")], "end_turn")]
+    # 主對話的 task 本身也走 check_permission，所以這裡直接呼叫 run_subagent
+    client = RoutedClient([], sub)
+    out = agent.run_subagent(client, "q", agent.new_log_path(), 1)
+    r = sub_result(client)[0]
+    assert r["is_error"] is True and "權限層拒絕" in r["content"] and out == {"content": "被拒"}
+
+def test_subagent_permission_exception_is_denied(env, monkeypatch):
+    def boom(name, args):
+        raise ValueError("壞參數")
+    monkeypatch.setattr(agent, "check_permission", boom)
+    client = RoutedClient([], [msg([tool("a", "read_file", path="a")], "tool_use"), msg([text("好")], "end_turn")])
+    agent.run_subagent(client, "q", agent.new_log_path(), 1)
+    r = client.sub.calls[1]["messages"][-1]["content"][0]
+    assert r["is_error"] is True and "壞參數" in r["content"]
+
+def test_subagent_turn_limit_returns_text_with_reason(env, monkeypatch):
+    monkeypatch.setattr(agent, "SUBAGENT_MAX_TURNS", 2)
+    loop = lambda i, t: msg(([text(t)] if t else []) + [tool(f"s{i}", "glob", pattern="*")], "tool_use")
+    out = agent.run_subagent(RoutedClient([], [loop(1, "進度A"), loop(2, "")]), "q", agent.new_log_path(), 1)
+    assert "進度A" in out["content"] and "輪數用完（2 輪）" in out["content"] and "is_error" not in out
+    out = agent.run_subagent(RoutedClient([], [loop(1, ""), loop(2, "")]), "q", agent.new_log_path(), 1)
+    assert out["is_error"] is True and "輪數用完" in out["content"]
+
+def test_subagent_max_tokens_refusal_and_empty_end_turn(env):
+    run_sub = lambda m: agent.run_subagent(RoutedClient([], [m]), "q", agent.new_log_path(), 1)
+    out = run_sub(msg([text("半截")], "max_tokens"))
+    assert "半截" in out["content"] and "stop_reason=max_tokens" in out["content"] and "is_error" not in out
+    out = run_sub(msg([], "refusal"))
+    assert out["is_error"] is True and "refusal" in out["content"]
+    out = run_sub(msg([], "end_turn"))
+    assert out["is_error"] is True and "沒有產生任何文字" in out["content"]
+    assert run_sub(msg([text("  完成  ")], "end_turn")) == {"content": "完成"}
+
+def test_subagent_result_is_truncated(env):
+    out = agent.run_subagent(RoutedClient([], [msg([text("字" * 30000)], "end_turn")]), "q", agent.new_log_path(), 1)
+    assert "截斷了" in out["content"] and len(out["content"]) < 11000
+
+def test_subagent_usage_does_not_touch_last_usage_or_compaction(env):
+    # sub 的 usage 遠超 COMPACT_AT_TOKENS(20000)；若混進 LAST_USAGE，主對話下一輪前就會觸發壓縮
+    sub = [msg([tool("s1", "glob", pattern="*")], "tool_use", usage=(50000, 900)), msg([text("完")], "end_turn", usage=(60000, 10))]
+    main = [msg([task_call()], "tool_use", usage=(100, 5)), msg([text("ok")], "end_turn", usage=(200, 6))]
+    client, _, _ = run2(main, sub, env)
+    assert len(client.main.calls) == 2
+    assert (agent.LAST_USAGE.input_tokens, agent.LAST_USAGE.output_tokens) == (200, 6)
+
+def test_task_terminal_display(env, capsys):
+    put("a.txt", "x")
+    sub = [msg([tool("s1", "grep", pattern="折扣")], "tool_use", usage=(10, 2)),
+           msg([tool("s2", "read_file", path="a.txt")], "tool_use", usage=(20, 3)),
+           msg([text("完")], "end_turn", usage=(30, 4))]
+    run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], sub, env)
+    out = capsys.readouterr().out
+    assert "→ task: 找折扣函式" in out and "  ↳ [sub] grep(折扣)" in out and "  ↳ [sub] read_file(a.txt)" in out
+    assert "  ↳ [sub] 完成（3 輪，in=60 out=9 tokens）" in out
+
+def test_task_permission_allowed_even_in_ask_mode(ask_env):
+    ask_env()
+    assert agent.check_permission("task", {"description": "d", "prompt": "p"})[0] == "allow"
+
+def test_task_bad_prompt_is_error_and_not_counted(env):
+    for bad in ({}, {"prompt": ""}, {"prompt": "  "}, {"prompt": 3}):
+        client, messages, _ = run2([msg([tool("k", "task", description="d", **bad)], "tool_use"), msg([text("ok")], "end_turn")], [], env)
+        assert messages[2]["content"][0]["is_error"] is True and client.sub.calls == []
+    assert agent.SUB_COUNT == 0
+
+def test_execute_tool_has_no_task_so_it_cannot_recurse(env):
+    assert agent.execute_tool("task", {"description": "d", "prompt": "p"})["is_error"] is True
+
+def test_keyboard_interrupt_in_subagent_keeps_main_history_valid(env):
+    messages = []
+    with pytest.raises(KeyboardInterrupt):
+        run2([msg([task_call("k1"), tool("k2", "grep", pattern="x")], "tool_use")],
+             [msg([tool("s1", "glob", pattern="*")], "tool_use"), KeyboardInterrupt()], env, messages=messages)
+    assert messages[-1]["role"] == "user" and [r["tool_use_id"] for r in messages[-1]["content"]] == ["k1", "k2"]
+    check_pairing(messages)
+    agent.add_user_text(messages, "再來")
+    check_pairing(messages)
+
+def test_api_error_in_subagent_becomes_task_error_and_batch_continues(env, capsys):
+    err = anthropic.APIConnectionError(request=httpx2.Request("POST", "http://x"))
+    main = [msg([tool("w", "write_file", path="a.txt", content="hi"), task_call("k")], "tool_use"), msg([text("好")], "end_turn")]
+    client, messages, log = run2(main, [err], env)
+    assert "[API 錯誤] subagent" in capsys.readouterr().out
+    check_pairing(messages)
+    w, k = messages[2]["content"]
+    assert w["tool_use_id"] == "w" and "is_error" not in w and (agent.WORKDIR / "a.txt").read_text() == "hi"   # 先寫入的結果是真的，不是「未執行」
+    assert k["is_error"] is True and "subagent API 失敗（APIConnectionError" in k["content"] and "沒有結論" in k["content"]
+    assert len(client.main.calls) == 2 and messages[-1]["role"] == "assistant"   # 主對話繼續下一輪
+    e = next(r for r in log_rows(log) if "error" in r)
+    assert e["agent"] == "sub" and e["sub_id"] == 1 and e["error"]["type"] == "APIConnectionError"
+
+def test_task_after_rejected_tool_is_skipped_without_calling_subagent(env, ask_env):
+    ask_env("n", "")
+    client, messages, _ = run2([msg([tool("w", "write_file", path="a.txt", content="x"), task_call("k")], "tool_use"), msg([text("好")], "end_turn")], [], env)
+    assert client.sub.calls == [] and agent.SUB_COUNT == 0
+    assert [r["tool_use_id"] for r in messages[2]["content"]] == ["w", "k"] and all(r["is_error"] for r in messages[2]["content"])
+    assert "沒有執行" in messages[2]["content"][1]["content"]
+
+def test_log_rows_tagged_with_agent_and_sub_id(env):
+    put("a.txt", "x" * 50)
+    sub1 = [msg([tool("s1", "read_file", path="a.txt")], "tool_use"), msg([text("一")], "end_turn")]
+    sub2 = [msg([text("二")], "end_turn")]
+    _, _, log = run2([msg([task_call("k1")], "tool_use"), msg([task_call("k2")], "tool_use"), msg([text("ok")], "end_turn")], sub1 + sub2, env)
+    rows = log_rows(log)
+    main_rows = [r for r in rows if r.get("agent") != "sub"]
+    sub_rows = [r for r in rows if r.get("agent") == "sub"]
+    assert all("sub_id" not in r for r in main_rows) and {r["sub_id"] for r in sub_rows} == {1, 2}
+    s1 = [r for r in sub_rows if r["sub_id"] == 1]
+    assert [("request" in r, "response" in r, "tool_result" in r) for r in s1] == [(True, True, False), (False, False, True), (True, True, False)]
+    assert next(r for r in s1 if "tool_result" in r)["tool_result"]["chars"] > 50
+    assert s1[0]["request"]["system"] == agent.SUBAGENT_SYSTEM
+    mtr = [r["tool_result"] for r in main_rows if "tool_result" in r]
+    assert [(t["tool"], t["chars"]) for t in mtr] == [("task", 1), ("task", 1)]
+    assert next(r for r in main_rows if "request" in r)["request"]["system"] == agent.SESSION_SYSTEM
+
+def test_subagent_does_not_break_compaction_cooldown_or_session_state(env, monkeypatch):
+    # 先放非零已知值；跑完 task 後三者都要不變（task 之後主對話那一輪會把 cooldown 減 1、LAST_USAGE 換成主對話自己的，所以用只跑到 task 為止的腳本檢查 sub 本身）
+    sentinel = SimpleNamespace(input_tokens=777, output_tokens=3)
+    monkeypatch.setattr(agent, "LAST_USAGE", sentinel)
+    monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 5)
+    before = agent.SESSION_SYSTEM
+    sub = msg([text("x")], "end_turn", usage=(50000, 900))
+    agent.run_task(RoutedClient([], [sub]), {"prompt": "q"}, agent.new_log_path())
+    assert agent.SESSION_SYSTEM == before and agent.COMPACT_COOLDOWN == 5 and agent.LAST_USAGE is sentinel
+
+def test_subagent_request_has_no_tool_choice_but_compaction_request_does(env):
+    # 對照：主對話的摘要請求會帶 tool_choice，sub 的請求不會（斷言才有鑑別力）
+    client, _, _ = run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], [msg([text("x")], "end_turn")], env)
+    assert all("tool_choice" not in c for c in client.sub.calls)
+    messages = [{"role": "user", "content": "hi"}]
+    main = RoutedClient([msg([text("摘要")], "end_turn")], [])
+    assert agent.compact(main, messages, agent.new_log_path(), 1) is True
+    assert main.main.calls[0]["tool_choice"] == {"type": "none"}
+
+
+# ---- v4-subagent：summarize_log ----
+def sub_row(sub_id, **kw):
+    return {"agent": "sub", "sub_id": sub_id, **kw}
+
+def sub_rows_log(back_chars=200, got_chars=5000, main_in=100, redo=False, with_task=True):
+    """主對話：task -> (之後可選地自己又 grep) -> end_turn；subagent：grep -> end_turn。"""
+    uses = [{"type": "tool_use", "id": "k1", "name": "task", "input": {"description": "d", "prompt": "p"}}] if with_task else []
+    rows = [{"turn": 1, "request": {"system": MEM_SYS, "messages": []}, "response": {"stop_reason": "tool_use", "content": uses,
+            "usage": {"input_tokens": main_in, "output_tokens": 5}}},
+            sub_row(1, turn=1, request={"system": agent.SUBAGENT_SYSTEM, "messages": []},
+                    response={"stop_reason": "tool_use", "usage": {"input_tokens": 999999, "output_tokens": 77},
+                              "content": [{"type": "tool_use", "id": "s1", "name": "grep", "input": {"pattern": "discount"}}]}),
+            sub_row(1, turn=1, tool_result={"id": "s1", "tool": "grep", "is_error": False, "content": "x", "chars": got_chars}),
+            sub_row(1, turn=2, request={"system": agent.SUBAGENT_SYSTEM, "messages": []},
+                    response={"stop_reason": "end_turn", "content": [], "usage": {"input_tokens": 888888, "output_tokens": 11}}),
+            {"turn": 1, "tool_result": {"id": "k1", "tool": "task", "is_error": False, "content": "結論", "chars": back_chars}}]
+    nxt = [{"type": "tool_use", "id": "g1", "name": "grep", "input": {"pattern": "again"}}] if redo else []
+    rows.append({"turn": 2, "request": {"system": MEM_SYS, "messages": []},
+                 "response": {"stop_reason": "end_turn", "content": nxt, "usage": {"input_tokens": main_in + 50, "output_tokens": 5}}})
+    return rows
+
+def test_read_rows_splits_main_and_sub(tmp_path):
+    mod, _, _ = judge_setup(tmp_path)
+    p = fake_rows(tmp_path, sub_rows_log())
+    assert mod.read_rows(p, sub=True) and not any(d.get("agent") == "sub" for d in mod.read_rows(p))
+
+def test_summarize_judge_v4_ignores_sub_system(tmp_path):
+    mod, _, _ = judge_setup(tmp_path)
+    res = mod.judge_v4(fake_rows(tmp_path, sub_rows_log()))
+    assert res and all(ok for ok, _, _ in res) and "共 2 個" in res[0][1]   # 只有主對話的 2 個 request
+
+def test_summarize_v3_peak_ignores_sub_usage(tmp_path):
+    mod, _, _ = judge_setup(tmp_path)
+    res = mod.judge_v3(fake_rows(tmp_path, sub_rows_log()), tmp_path / "none", tmp_path / "none2", 8000)
+    assert "峰值 150" in res[4][1] and res[4][0] is True   # 不是 999999
+
+def test_summarize_prints_sub_summary_under_main_turn_and_main_totals(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log()), capsys)
+    assert "↳ sub#1：2 輪 in=1888887 out=88 | grep(discount)" in out
+    assert "工具呼叫次數: {'task': 1}" in out and "總 tokens: input=250 output=10" in out   # 主對話自己的
+
+def test_subagent_judge_pass(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log(back_chars=200, got_chars=5000)), capsys)
+    sec = out.split("v4-subagent 判定")[1]
+    assert sec.count("✅ PASS") == 3 and "❌" not in sec and "200 字元 < subagent 收到的工具結果（截斷後）5000 字元" in sec
+    assert "主對話 input_tokens 峰值：150" in sec and "input=1888887 output=88" in sec and "（重做搜尋）：0 次" in sec
+    assert "mini_repo" not in out.split("v4-subagent 判定")[1].split("結果")[1] and "v1 完成標準" not in out
+
+def test_subagent_log_prints_v1_skip_notice_and_exit_code_reflects_fail(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    ok = mod.main([str(fake_rows(tmp_path, sub_rows_log()))])
+    assert ok == 0 and "略過 v1 判定：這類 log 是唯讀問答" in capsys.readouterr().out
+    bad = mod.main([str(fake_rows(tmp_path, sub_rows_log(back_chars=1000, got_chars=5000)))])
+    assert bad == 1   # 以前回傳 list，exit code 永遠是 0
+
+def test_subagent_log_still_runs_v3_judge(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    rows = sub_rows_log()
+    rows[0]["request"]["messages"] = [{"role": "user", "content": "docstring_repo"}]
+    out = v4_out(mod, fake_rows(tmp_path, rows), capsys)
+    assert "v3 完成標準判定" in out and "v4-subagent 判定" in out
+
+def test_subagent_judge_fail_when_return_too_long(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log(back_chars=1000, got_chars=5000)), capsys)   # 剛好 20% 也算不乾淨
+    assert "❌ FAIL 3." in out and "比例 20.0%" in out and "有未通過項目" in out
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log(back_chars=999, got_chars=5000)), capsys)
+    assert "✅ PASS 3." in out
+
+def test_subagent_judge_fail_items_1_2_and_redo_observation(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log(with_task=False)), capsys)
+    assert "❌ FAIL 1." in out
+    out = v4_out(mod, fake_rows(tmp_path, sub_rows_log(redo=True)), capsys)
+    assert "（重做搜尋）：1 次" in out and "grep(again)" in out
+    rows = [r for r in sub_rows_log() if not ("tool_result" in r and r.get("agent") == "sub")]   # subagent 沒用工具、沒收到結果
+    for r in rows:
+        if r.get("agent") == "sub" and "response" in r:
+            r["response"]["content"] = []
+    out = v4_out(mod, fake_rows(tmp_path, rows), capsys)
+    assert "❌ FAIL 2." in out and "❌ FAIL 3." in out   # subagent 一個工具都沒用、沒有工具結果
+
+def test_subagent_judge_absent_without_sub_rows_and_old_logs(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    assert mod.judge_subagent(fake_rows(tmp_path, [req_row(1, "S", "ls")])) is None
+    assert "v4-subagent" not in v4_out(mod, fake_rows(tmp_path, [req_row(1, "S", "ls")]), capsys)
+
+def test_end_to_end_run_then_summarize_pass(env, capsys):
+    put("big.py", "\n".join(f"line {i} discount" for i in range(300)))
+    sub = [msg([tool("s1", "grep", pattern="discount")], "tool_use", usage=(500, 20)), msg([text("big.py 全是")], "end_turn", usage=(900, 10))]
+    _, _, log = run2([msg([task_call()], "tool_use", usage=(100, 5)), msg([text("ok")], "end_turn", usage=(120, 5))], sub, env)
+    capsys.readouterr()
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    summarize_log.main([str(log)])
+    sec = capsys.readouterr().out.split("v4-subagent 判定")[1]
+    assert sec.count("✅ PASS") == 3 and "全部通過" in sec and "input=1400 output=30" in sec
+
+
+def test_v3_judge_gated_on_task_text_not_tool_output(tmp_path, capsys):
+    # 真實踩到：subagent 的 glob 輸出含 docstring_repo，舊判斷用整份 log 文字，誤開 v3 判定並讀到 sandbox 現況而顯示 ALL OK
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    rows = [{"turn": 1, "request": {"messages": [{"role": "user", "content": "盤點 mini_repo 的折扣函式"}]},
+             "response": {"stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 1},
+                          "content": [{"type": "text", "text": "看過 docstring_repo/ 與 mini_repo/"}]}}]
+    p = tmp_path / "x.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    summarize_log.main([str(p)])
+    assert "v3 完成標準判定" not in capsys.readouterr().out

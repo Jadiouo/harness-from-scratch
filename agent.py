@@ -1,4 +1,4 @@
-"""v4 迷你 coding agent：手寫 agent loop + 7 個工具（read_file/write_file/edit/grep/glob/bash/todo_write）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）。不用框架、不用 SDK tool runner。"""
+"""v4 迷你 coding agent：手寫 agent loop + 8 個工具（read_file/write_file/edit/grep/glob/bash/todo_write/task）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）+ subagent。不用框架、不用 SDK tool runner。"""
 import fnmatch, json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
@@ -9,8 +9,9 @@ import anthropic   # import 本身不需要 key；client 在 main 才建立
 # v3 同理：刻意不提示「context 可能被壓縮」，要觀察光靠摘要本身夠不夠讓它接續。
 # 放在最上面，方便實驗：拿掉一段，看行為怎麼變。
 SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
-你有七個工具：read_file、write_file、edit、grep、glob、bash、todo_write。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
+你有八個工具：read_file、write_file、edit、grep、glob、bash、todo_write、task。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
 先想清楚要做什麼，再動手。工作順序：不熟的程式碼先用 glob/grep 找位置，再 read_file 讀相關段落，再用 edit 做最小修改，最後用 bash 驗證。
+需要大範圍搜尋、讀很多檔但只需要結論時，用 task 交給 subagent，讓自己的 context 保持乾淨。
 三個步驟以上的任務，動手前先用 todo_write 列出步驟清單，每完成一項就更新；context 被壓縮後，照清單接著做。
 改完或寫完程式後，一定要實際執行（用 bash）驗證結果，不要只憑推測說「應該可以」。
 工具回傳錯誤時，讀懂錯誤訊息並修正，不要重複同一個失敗的動作。
@@ -107,6 +108,17 @@ TOOLS = [
                                                                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
                                                          "required": ["content", "status"]}}},
                       "required": ["todos"]}},
+    # 同 todo_write：靠描述引導。但 TODO 實驗證明只靠描述模型不會自發使用，所以 SYSTEM_PROMPT 也補了一句
+    {"name": "task",
+     "description": "把一件「大範圍搜尋、要讀很多檔、但你只需要結論」的工作交給 subagent。"
+                    "它在全新的對話裡工作，用完會把整段探索過程丟掉，只回傳一段結論文字，所以你的 context 不會被搜尋結果塞滿。"
+                    "它看不到你和使用者的對話，prompt 必須自己講清楚：要找什麼、範圍、希望回報的格式。"
+                    "它只能讀（read_file、grep、glob），不能改檔、不能執行指令、不能再派 subagent；回傳只有最後的結論文字，不含它讀過的檔案內容。"
+                    "已經知道要看哪個檔、一兩次 grep 就能解決的事不要用，自己做更快。",
+     "input_schema": {"type": "object",
+                      "properties": {"description": {"type": "string", "description": "3-8 字的短標題，只用來在終端顯示"},
+                                     "prompt": {"type": "string", "description": "給 subagent 的完整指示（它看不到主對話，要自足）"}},
+                      "required": ["description", "prompt"]}},
 ]
 
 # ==== 【harness 角色：輸出截斷】工具輸出會進 context，太長會吃光窗口，所以保留頭尾 ====
@@ -337,6 +349,8 @@ def check_permission(name, args):
     # 2. 規則
     if name in ("read_file", "grep", "glob"):
         return "allow", "唯讀工具"
+    if name == "task":   # subagent 內部只有 read_file/grep/glob 三個唯讀工具，且每個工具仍會逐一過這個函式
+        return "allow", "subagent 內部只用唯讀工具"
     if name == "todo_write":   # 只改 harness 記憶體裡的清單、不碰檔案，沒有東西需要守；放在 allow_all 判斷之前，ask 模式也不會問
         return "allow", "只更新 harness 內的 TODO 清單，不碰檔案"
     if PERMISSION_MODE == "allow_all":
@@ -445,8 +459,9 @@ SESSION_SYSTEM = SYSTEM_PROMPT
 SESSION_MEMORY = None   # /memory 顯示用
 
 # ==== 【harness 角色：request 組裝】把 system、tools、歷史打包成一次 API 呼叫 ====
-def build_request(messages):
-    kwargs = dict(model=MODEL, max_tokens=16000, system=SESSION_SYSTEM, tools=TOOLS,
+def build_request(messages, system=None, tools=None):
+    # 預設是主對話的 system/tools；subagent 傳自己的。每一段對話內部必須固定（簽章綁定），不同對話之間可以不同
+    kwargs = dict(model=MODEL, max_tokens=16000, system=system or SESSION_SYSTEM, tools=tools or TOOLS,
                   messages=messages, output_config={"effort": EFFORT})
     if USE_FALLBACKS:
         # SDK 1.14.0 的 BetaFallbacksParam 接受 Literal["default"]，所以直接傳字串，不需要 extra_body
@@ -473,6 +488,92 @@ def close_dangling(messages):
         messages.append({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": i, "content": "Error: 工具未執行（回應被截斷或中斷）",
              "is_error": True} for i in ids]})
+
+# ==== 【harness 角色：subagent】把「大範圍搜尋」丟進另一段獨立對話，主對話只收到一段結論 ====
+# 為什麼省 context：subagent 的每次 grep/read_file 結果都留在它自己的 messages，結束就丟掉；主對話只多一則 tool_result（結論）。
+# 注意 token 並沒有省：subagent 花的 token 照付（甚至更多），省的是主對話之後每一輪都要重送的 context。
+# 為什麼 system/tools 可以和主對話不同：thinking 簽章綁定的是「同一段對話」的 system＋tools＋前面所有訊息，
+# subagent 是另一段對話，簽章各自綁定，不會 400；但同一個 subagent 對話內 system/tools 也必須固定（所以只在這裡定義一次）。
+# 唯讀、不能遞迴：SUB_TOOLS 沒有寫入工具也沒有 task；工具仍經 check_permission，路徑 deny 照樣生效。
+# 不做 compaction：短命對話，上限 SUBAGENT_MAX_TURNS 輪就停，比實作壓縮簡單。
+SUBAGENT_MAX_TURNS = 20
+SUBAGENT_SYSTEM = """你是唯讀的搜尋助手，在 WORKDIR 資料夾裡工作，只有 read_file、grep、glob 三個工具，不能改檔或執行指令。
+你看不到發出任務的人和使用者的對話，只能依任務指示工作。先用 glob/grep 找位置，再 read_file 讀必要的段落。
+最後用精簡的條列回報結論，每一項附上檔案路徑:行號；不要貼大段程式碼。找不到就直接說找不到，不要猜。"""
+SUB_TOOLS = [t for t in TOOLS if t["name"] in ("read_file", "grep", "glob")]   # 同一份定義，不另寫
+SUB_COUNT = 0   # 本 session 第幾次 task 呼叫，log 用來分辨不同的 subagent
+
+def _sub_log(log, sub_id, row):
+    with open(log, "a") as f:
+        f.write(json.dumps({"agent": "sub", "sub_id": sub_id, **row}, ensure_ascii=False, default=to_jsonable) + "\n")
+
+def _sub_tool(block):
+    # 不能在 subagent 裡跳出 input 詢問：不是 allow 一律當拒絕回 is_error
+    if block.name not in {t["name"] for t in SUB_TOOLS}:
+        return {"content": f"Error: subagent 沒有 {block.name} 這個工具，只能用 read_file、grep、glob", "is_error": True}
+    try:
+        decision, reason = check_permission(block.name, block.input)
+    except Exception as e:
+        decision, reason = "deny", f"參數無法判斷（{e}）"
+    if decision != "allow":
+        return {"content": f"權限層拒絕：{reason}", "is_error": True}
+    return execute_tool(block.name, block.input)
+
+def run_subagent(client, prompt, log, sub_id):
+    """跑一段全新的對話，回傳 tool_result 內容 {"content", ["is_error"]}。API 例外由 run_task 接住；Ctrl-C 直接往上拋，由主對話的 close_dangling 收尾。"""
+    messages = [{"role": "user", "content": prompt}]
+    tin = tout = turns = 0
+    last_text, why = "", None
+    for turn in range(1, SUBAGENT_MAX_TURNS + 1):
+        turns = turn
+        kwargs = build_request(messages, system=SUBAGENT_SYSTEM, tools=SUB_TOOLS)
+        response = client.beta.messages.create(**kwargs)
+        u = getattr(response, "usage", None)   # 只累計在這裡，絕不碰 LAST_USAGE（壓縮判斷看的是主對話的長度）
+        tin += getattr(u, "input_tokens", 0) or 0
+        tout += getattr(u, "output_tokens", 0) or 0
+        _sub_log(log, sub_id, {"turn": turn, "request": {k: kwargs[k] for k in ("model", "system", "tools", "messages")},
+                               "response": response.model_dump(mode="json")})
+        messages.append({"role": "assistant", "content": response.content})
+        text = "\n".join(b.text for b in response.content if b.type == "text").strip()
+        if response.stop_reason == "end_turn":
+            last_text = text
+            break
+        if response.stop_reason != "tool_use":   # max_tokens、refusal 等：留下已有的文字就收
+            last_text, why = text or last_text, f"stop_reason={response.stop_reason}"
+            break
+        last_text = text or last_text
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            print(f"  ↳ [sub] {block.name}({block.input.get('pattern') or block.input.get('path') or ''})")
+            r = _sub_tool(block)
+            results.append({"type": "tool_result", "tool_use_id": block.id, **r})
+            _sub_log(log, sub_id, {"turn": turn, "tool_result": {"id": block.id, "tool": block.name, "is_error": bool(r.get("is_error")),
+                                   "content": str(r["content"])[:300], "chars": len(str(r["content"]))}})
+        messages.append({"role": "user", "content": results})
+    else:
+        why = f"輪數用完（{SUBAGENT_MAX_TURNS} 輪）"
+    print(f"  ↳ [sub] {'完成' if not why else '提前結束：' + why}（{turns} 輪，in={tin} out={tout} tokens）")
+    if not why:
+        return {"content": truncate(last_text)} if last_text else {"content": "Error: subagent 沒有產生任何文字結論", "is_error": True}
+    if not last_text:
+        return {"content": f"Error: subagent 提前結束（{why}），沒有任何文字結論", "is_error": True}
+    return {"content": truncate(f"{last_text}\n[subagent 提前結束：{why}，以上結論可能不完整]")}
+
+def run_task(client, args, log):
+    global SUB_COUNT
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return {"content": "Error: task 需要非空的 prompt 字串", "is_error": True}
+    SUB_COUNT += 1
+    try:
+        return run_subagent(client, prompt, log, SUB_COUNT)
+    except anthropic.APIError as e:
+        # 不能往上拋：同批在 task 之前已執行的工具（例如 write_file）結果會被丟掉，close_dangling 還會誤標成「未執行」。轉成這個 task 自己的錯誤，同批繼續
+        _sub_log(log, SUB_COUNT, {"error": {"type": type(e).__name__, "message": str(e)}})
+        print(f"[API 錯誤] subagent：{type(e).__name__}: {e}")
+        return {"content": f"Error: subagent API 失敗（{type(e).__name__}: {str(e)[:200]}），沒有結論", "is_error": True}
 
 # ==== 【harness 角色：上下文管理（compaction）】歷史每輪都整段重送，會越來越長；超過門檻就把整段歷史換成「摘要＋使用者原文」 ====
 # 不採「清掉舊 tool_result」：歷史只能往後加（thinking 區塊綁定整段對話，改寫舊訊息可能讓它們失效而 400）。
@@ -637,20 +738,21 @@ def _loop(client, messages, log):
                             "answer": None, "reason": f"同批前面的 {rejected} 被拒絕"}
                     refusal = {"content": f"因為同一批中前面的 {rejected} 操作被拒絕，這個操作沒有執行。", "is_error": True}
                 else:
-                    summary = block.input.get("command") or block.input.get("pattern") or block.input.get("path") or ""
+                    summary = block.input.get("command") or block.input.get("pattern") or block.input.get("path") or block.input.get("description") or ""
                     print(f"→ {block.name}: {summary}")
                     refusal, perm = authorize(block)
                     rejected = block.name if refusal else None
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
-                result = refusal or execute_tool(block.name, block.input)
+                result = refusal or (run_task(client, block.input, log) if block.name == "task" else execute_tool(block.name, block.input))
                 if not refusal and block.name != "todo_write":   # todo_write 自己會印完整清單
                     print(f"  {result['content'][:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, **result})
                 # 「記錄一切」：壓縮會換掉歷史，之後只有這行能查到哪些操作成功過（request 裡的 tool_result 已被摘要取代）
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "tool_result": {"id": block.id, "tool": block.name,
-                            "is_error": bool(result.get("is_error")), "content": str(result["content"])[:300]}},
+                            "is_error": bool(result.get("is_error")), "content": str(result["content"])[:300],
+                            "chars": len(str(result["content"]))}},
                             ensure_ascii=False) + "\n")
             messages.append({"role": "user", "content": results})
         elif reason == "end_turn":
@@ -700,8 +802,9 @@ def main():
         sys.exit(1)
     client = anthropic.Anthropic()   # 在這裡才建立，沒有 API key 時 import agent 不會爆
     log, messages = new_log_path(), []
-    global LAST_USAGE, COMPACT_COOLDOWN, SESSION_SYSTEM, SESSION_MEMORY
+    global LAST_USAGE, COMPACT_COOLDOWN, SESSION_SYSTEM, SESSION_MEMORY, SUB_COUNT
     LAST_USAGE = None
+    SUB_COUNT = 0
     COMPACT_COOLDOWN = 0
     SESSION_MEMORY = load_memory()
     SESSION_SYSTEM = build_system(SESSION_MEMORY)
