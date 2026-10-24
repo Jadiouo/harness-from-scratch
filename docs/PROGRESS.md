@@ -215,3 +215,9 @@
 - requirements 補 httpx2 並固定範圍；乾淨 venv 實跑 `270 passed`。新增 MIT LICENSE；HANDOFF 署名改 @Jadiouo。
 - 使用者決定：GitHub 先 private 再公開；README 中英雙語；repo 名 coding-agent-from-scratch；commit 作者改 noreply、保留歷史、拿掉 session 網址；PROGRESS 與 docs/review 公開＋精選 log 放 evidence/；授權 MIT。
 - 未採納／延後：補跑各實驗 3–5 次（統計委員要求）——先以降級措辭處理，之後可補。
+
+## 推上 GitHub（private）
+- 改寫歷史：作者／提交者改 `Jadiouo <215644065+Jadiouo@users.noreply.github.com>`、移除 commit 的 Claude-Session 行（保留 Co-Authored-By）；審查檔中的 email 與家目錄字樣也從歷史中移除；scripts/sanitize_logs.py 改為執行時取得家目錄與使用者名，不寫死。本 repo 的 git user.email 設為 noreply。
+- 舊歷史只留在本機分支 backup/pre-rewrite（未推送）。
+- 推送 main 到 https://github.com/Jadiouo/coding-agent-from-scratch（PRIVATE）。重新 clone 驗證：78 個檔案，無 logs/、sandbox/、.env、.agent；全歷史掃描 email／家目錄／session 網址／key 皆 0。pytest `270 passed`。
+- 待使用者：在 GitHub 上看過後自行轉 public。
