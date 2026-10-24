@@ -1,2 +1,5 @@
-anthropic>=1.14.0
-pytest
+# 以 .venv 實際版本為準（Python 3.11.15；anthropic 要求 Python >= 3.10）
+anthropic>=1.14.0,<2
+# tests/test_agent.py 直接 import httpx2；它同時是 anthropic 的傳遞依賴（httpx2<3,>=2.0.0），這裡明列避免隱性依賴
+httpx2>=2.13,<3
+pytest>=9.1,<10

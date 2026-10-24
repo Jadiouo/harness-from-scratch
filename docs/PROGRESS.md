@@ -1,5 +1,11 @@
 # 進度
 
+## 用語與證據分級（第 1 輪閉門會議後統一，2026-10-24）
+- **n=1**：本檔所有真實 API 的對照實驗（v1 A/B、v4 記憶、v4 TODO 無／有提示、v4 subagent、hooks）都只各跑 1 次，屬**示範**，不是統計結論；跨次變異沒有量。行為觀察（工具選擇、是否自發用 TODO）一律只能讀成「在這個任務、這一次」。
+- **證據三級**：(1) 決定性機制事實（API 400、離線測試證明的不變量）；(2) 單次實測的量測值（token、輪數）；(3) 單次的行為觀察（模型選了哪個工具、是否改走別的路）。
+- **峰值**：統一定義為「單次請求的 `input_tokens` 最大值」，並一律標註範圍：「主對話各輪」不含摘要請求；「摘要請求本身」另列。`summarize_log.py` 的 v3 第 5 項與 v4-subagent 的「主對話 input_tokens 峰值」輸出則是兩者合併取最大（含摘要請求），與本檔標註「主對話各輪」的數字口徑不同，比較時先看標註。
+- 以下各節保留原始結果，只在標題或結論處補上分級與口徑。
+
 ## 2026-10-15 — v0
 
 ### 已定案的決定
@@ -71,7 +77,7 @@
 - 修補後 pytest `121 passed`（2026-10-24 重跑確認）。
 
 ### v2 真實測驗第 1 次（logs/v2-run1-all-yes.jsonl）— 未達測驗條件
-- 6 次 ask 全部回 y，沒有任何拒絕，所以「拒絕後改走別的路」沒被測到（判定 1、3 FAIL 是因為沒有 n，不是模型問題）。
+- 5 次 ask（edit 2、bash 3）全部回 y，沒有任何拒絕，所以「拒絕後改走別的路」沒被測到（判定 1、3 FAIL 是因為沒有 n，不是模型問題）。
 - 權限層行為正確：read_file/grep 自動放行；每次 edit 與 bash（python3 check.py）都有詢問。
 - 觀察：
   - 模型順手改了 check.py 第 65 行的預期字串以配合英文化——合理，但正是「agent 改測試」的典型；權限層讓人有機會在這一步攔下。
@@ -79,9 +85,10 @@
   - 又踩一次 `python` → `python3`（跨 session 沒有記憶；v4 的 CLAUDE.md 載入可解）。
   - 核准疲勞：3 次 bash 指令只差一點點（`python` vs `python3`、多一段 `python3 -c`），「a＝完全相同指令」幫不上忙。Claude Code 用前綴規則（如 `Bash(python3 check.py:*)`）處理。候選改進，未定。
 
-### v2 真實測驗第 2 次（logs/v2-run2-reject.jsonl）— v2 完成標準通過
+### v2 真實測驗第 2 次（logs/v2-run2-reject.jsonl）— v2 完成標準通過（但「改走別的路」受拒絕理由混淆，見下；n=1）
 - 4 項判定全 PASS。第 3 輪模型一次送出 3 個 tool_use：edit reports.py（使用者 n＋理由）、edit check.py（y）、bash 跑 check（n）。
-- 被拒絕後沒有重試，改為列出修改對照表並等待確認；且主動指出「同批的 check.py 已經被改了，reports.py 沒改，所以現在不一致，可以幫你改回去」。
+- 被拒絕後沒有重試，改為列出修改對照表並等待確認（這與當時填的拒絕理由「先把你打算怎麼改列給我看」一致，所以證明的是「模型會讀拒絕理由並照辦」；「理由留空時能否自己換方法」沒有測到）；且主動指出「同批的 check.py 已經被改了，reports.py 沒改，所以現在不一致，可以幫你改回去」。
+- 證據分級（降級）：此次拒絕理由本身就引導模型照做（混淆），所以「拒絕後改走別的路」只能讀成「模型會讀拒絕理由並照辦、不盲目重試」；光靠「被拒絕」這個事實是否會自己換方法，沒有隔離、沒有測到（要測需回 `n` 且理由留空並重跑）。屬單次行為觀察。
 - 新發現的 harness 問題：同一則回應裡的多個 tool_use 是互相依賴的計畫，權限層卻逐一獨立詢問 → 拒絕第 1 個、核准第 2 個，造成半套狀態。候選修法：同批中有一個被拒絕，後面的自動以「同批前一個操作被拒絕，未執行」回覆（Claude Code 的拒絕也會中止該回合，待確認細節）。未定，待使用者決定。
 - 採納（使用者選 1）：同批連帶略過——同一則回應中第一個被拒絕（n 或 deny）之後的 tool_use 不詢問、不執行，回 is_error「同批前面的 X 被拒絕」，log decision="skipped"；拒絕前已執行的保留真實結果（不回滾）。summarize_log 加第 5 項判定，對修改前錄的 v2-run2-reject.jsonl 正確判 FAIL。pytest `126 passed`。純 harness 邏輯，離線測試即可驗證，未再跑真實 API。
 
@@ -106,12 +113,13 @@
 - 確認無問題：tool_choice none 與 fallbacks 相容（SDK 有型別，推論未實打）；SESSION_ALLOW 壓縮後仍有效；壓縮在邊界做、失敗時歷史不變。
 
 ### v3 真實測驗第 1 次（logs/v3-run1-bindfail.jsonl）— 未通過，兩個原因
-- **摘要請求 400**：`Invalid signature in thinking block. The block is bound to a different conversation ... The system prompt differs`。官方文件（claude-api skill shared/model-migration.md「Breaking change 3」）：thinking 簽章綁定 top-level system＋tools＋之前所有訊息；tool_choice、max_tokens 等不在綁定範圍。修：摘要請求沿用 SYSTEM_PROMPT 與 TOOLS（刪掉 SUMMARIZER_SYSTEM），只附加摘要指示、tool_choice none。我們的整段替換屬文件推薦的「simple compaction」形狀。冷卻機制如設計運作（失敗後未每輪重試）。pytest `154 passed`。
+- **摘要請求 400**：`Invalid signature in thinking block. The block is bound to a different conversation ... The system prompt differs`。官方文件（出處：Anthropic claude-api 文件的 model migration 指南「Breaking change 3」，preserved thinking；非公開網址，以文字出處為準）：thinking 簽章綁定 top-level system＋tools＋之前所有訊息；tool_choice、max_tokens 等不在綁定範圍。修：摘要請求沿用 SYSTEM_PROMPT 與 TOOLS（刪掉 SUMMARIZER_SYSTEM），只附加摘要指示、tool_choice none。我們的整段替換屬文件推薦的「simple compaction」形狀。冷卻機制如設計運作（失敗後未每輪重試）。pytest `154 passed`。
 - **測驗被繞過**：模型讀完 24 檔後，用一次 bash heredoc 在 /tmp 寫 Python 腳本批次插入全部 docstring（使用者回 a 核准）→ 工具呼叫 29 次、ALL OK，但 v3 要測的長任務沒出現。修：任務句加「請用 edit 工具一個函式一個函式修改，不要寫腳本批次處理」。
 - 觀察：腳本寫到 /tmp（WORKDIR 外）——權限層有詢問（含 heredoc 判 ask），是人核准的；顯示「a＝這條完全相同的指令」在長指令上等同一次性的 y，核准者要讀內容。
 
-### v3 真實測驗第 2 次（logs/v3-run2-pass.jsonl）— v3 完成標準通過
-- 5 項全 PASS：16 輪、91 次工具呼叫（edit 56、read_file 31）、壓縮 4 次，input_tokens 峰值 11,313，每次壓縮後回到約 3.7k–4.1k；ALL OK；失憶偵測 0。總 tokens 148k（估約 0.9 美元）。
+### v3 真實測驗第 2 次（logs/v3-run2-pass.jsonl）— v3 完成標準通過（人為低門檻下的機制測試，n=1）
+- 證據分級（降級）：`COMPACT_AT_TOKENS=8000` 是人為壓低的門檻（真實模型上限高得多），任務句也被指定「用 edit 逐函式修改、不要寫腳本」。所以這次驗證的是「壓縮在密集觸發（4 次）下能運作並接得上任務」，**不是**「長任務不會爆 context」的上限證明，也沒測過沒有壓縮時會不會爆；「context 有界」只是相對於這個人為門檻。
+- 5 項全 PASS：16 輪、91 次工具呼叫（edit 56、read_file 31）、壓縮 4 次，主對話各輪 input 最高 9,858（4 次摘要請求本身的 input 最高 11,313），每次壓縮後回到約 3.7k–4.1k；ALL OK；失憶偵測 0。總 tokens 148k（主對話 102k＋摘要請求 46k）。
 - 觀察（未修，候選改進）：
   - **壓縮時機吃掉剛讀的內容**：第 4 輪讀了 6 個 geometry 檔 → 壓縮 → 第 5 輪原樣重讀同 6 檔；第 14 輪跑 check → 壓縮 → 第 15 輪重跑。原因：壓縮發生在 tool_result 剛回來之後，摘要裝不下檔案內容。可能改法：保留最後一輪的 tool_result（需剝掉被保留輪的 thinking，見 keep-tail 規則）、或在讀檔前預估觸發。
   - 模型自動改成「一批讀 6 檔→一批改」的節奏，剛好和壓縮週期對齊。
@@ -133,7 +141,7 @@
 ### v4-1 真實測驗（同一版程式，只差有沒有 sandbox/CLAUDE.md）— 通過
 - 有記憶（logs/v4-mem-with.jsonl）：第 1 輪就 `python3 hello.py`，2 輪完成；v4 判定全 PASS（system 2 個請求皆相同）。
 - 對照組無記憶（logs/v4-mem-control.jsonl）：第 2 輪 `python hello.py` 失敗，第 3 輪才 `python3`，4 輪完成。
-- 結論：CLAUDE.md 確實省掉一次「重新發現環境限制」的試錯。樣本各 1 次，屬示範而非統計。
+- 結論（降級）：在這個任務、這一次，有 CLAUDE.md 省掉一次「重新發現環境限制」的試錯。樣本各 1 次（n=1），屬示範而非統計。
 
 ## v4-2 TODO 工具（todo_write）
 - 設計（定案）：每次交整份清單、整份取代；狀態存 harness（TODOS）；system prompt 只列工具名、不寫 TODO 用法（觀察只靠工具描述會不會自發使用）；權限直接 allow；壓縮時在摘要後附 `【目前 TODO】` 區塊（清單是 harness 持有的事實，不靠摘要記）；/todo、/reset 清空。
@@ -154,10 +162,10 @@
 - 下一步：system prompt 加一句「三步以上先 todo_write 列清單、每完成一項更新、壓縮後照清單接著做」，同任務重跑當實驗組（對照組即本次）。pytest `206 passed`。
 
 ### v4-2 真實測驗第 2 次（logs/v4-todo-run2-hint.jsonl，system prompt 加 TODO 提示）— 通過
-- v4-TODO 判定 4 項全 PASS：第 2 輪就列 5 項清單（按資料夾＋最後驗證）；成功更新 6 次；最後全 completed；4 次壓縮都帶最新清單。v3 判定全 PASS（91 次工具呼叫、ALL OK、峰值 11,045）。
+- v4-TODO 判定 4 項全 PASS：第 2 輪就列 5 項清單（按資料夾＋最後驗證）；成功更新 6 次；最後全 completed；4 次壓縮都帶最新清單。v3 判定全 PASS（91 次工具呼叫、ALL OK、主對話各輪 input 最高 6,497；摘要請求本身最高 11,045）。
 - 每次壓縮後第一個動作都是 todo_write 更新清單，接著直接做下一個資料夾。
 - read_file 31 → 25：本次壓縮後**沒有重讀**（run1 有 1 次 6 檔重讀）。注意（推論）：本次壓縮都落在 edit 批次之後、而非剛讀完檔時，重讀減少可能主要來自壓縮時機不同，不能全歸功於清單；各 1 次樣本。
-- 對照結論：只靠工具描述 → 0 次使用；system prompt 加一句 → 規劃、更新、壓縮後接續都出現。與 v1「改工具描述比改程式有效」對照：這次是工具描述不夠、要 system prompt。
+- 對照結論（n=1，單次行為觀察，且壓縮時機不同有混淆）：在這個任務、這一次，只靠工具描述 → 0 次使用；system prompt 加一句 → 規劃、更新、壓縮後接續都出現。與 v1「改工具描述比改程式有效」對照：這次是工具描述不夠、要 system prompt。
 
 ## v4-3 subagent（task 工具）
 - 設計（定案）：task(description, prompt) → harness 開全新對話（SUBAGENT_SYSTEM、SUB_TOOLS＝read_file/grep/glob），最多 20 輪、不壓縮、不能再呼叫 task；只把最後文字回給主對話。sub 的 usage 不碰 LAST_USAGE。log 同檔，sub 行帶 agent=sub、sub_id；summarize_log 既有判定只看主對話行。system prompt 加一句 task 使用時機（記取 TODO 實驗教訓）。
@@ -174,13 +182,14 @@
 | | 實驗組（task） | 對照組（自己搜） |
 |---|---|---|
 | 主對話輪數 | 2 | 7 |
-| 主對話 input 峰值 | 6,026 | 10,164（因此觸發 1 次壓縮） |
+| 主對話各輪 input 最高（不含摘要請求） | 6,026 | 10,164（因此觸發 1 次壓縮，該次摘要請求本身 input 11,452） |
 | 主對話自己的工具呼叫 | task×1，之後 0 次重做搜尋 | glob 2、grep 5、read_file 4 |
 | subagent | 8 輪、read 13/glob 3/grep 2，in=53k | — |
 | 回給主對話 / sub 收到的工具結果 | 2,638 / 18,830 字元（14%） | — |
 | 總 tokens | 主 11k＋sub 56k ≈ 67k | 56k |
 | 答案 | 正確（loyalty_bonus 無人呼叫、bulk_restock 非銷售折扣、加分項 unit_price_after） | 同樣正確 |
-- 結論：主對話 context 保持乾淨（峰值低 4 成、不用壓縮），答案品質沒掉；總花費反而多約 2 成——subagent 省的是主對話 context，不是錢。
+- 總 tokens 拆解（log 實測）：實驗組＝主對話 input 9,569＋output 1,671＝11,240，加 subagent input 53,116＋output 3,190＝56,306，合計約 67.5k；對照組＝主對話 43,235＋壓縮的摘要請求 11,452＋1,619＝13,071，合計 56,306。兩邊都出現 56,306 屬巧合（已核對兩份 log 不同）。
+- 結論（n=1，單次量測、設計好的對照）：這個任務、這一次，主對話各輪 input 最高低約 4 成（不含摘要請求）、不用壓縮，答案品質沒掉；總花費反而多約 2 成——subagent 省的是主對話 context，不是錢。
 - 兩組都發現任務句寫錯路徑（WORKDIR 裡是 mini_repo/ 不是 sandbox/mini_repo），自行修正並在回答中說明。
 - summarize_log 誤判（真實踩到）：實驗組 log 印了 v3 判定且第 4 項顯示 ALL OK——v3 的開關原本是「整份 log 文字含 docstring_repo」，subagent 的 glob(**/*) 輸出含這個字；第 4 項又是讀 sandbox 現況而非 log。修：改看主對話的任務句（first_task_text）。pytest `240 passed`（含新測試）。
 - 已知限制（未修）：v3 第 4 項讀 sandbox 現況，事後換過 sandbox 再判舊 log 會不準。
@@ -199,3 +208,10 @@
 - v4-hooks 判定全 PASS：第 3 輪模型用 `print(..., file=sys.stderr)` → hook exit 2 ×2（回報行號＋規則）→ 第 4 輪模型說「依專案規定，把 print 改成 logging」，加 import logging／logger、改 logger.debug → 同批第 1 個 edit 時另一處 print 還在（exit 2），後兩個 edit 後 exit 0。最終 orders.py 無 print。
 - post 回報**沒設 is_error**，模型仍注意到並修正——尾端附文字的回饋就足夠。
 - 模型自行驗證 A17 失敗是既有的：在 /tmp 做一份去掉改動的副本跑基準（bash 經詢問、使用者回 a）。觀察：這條指令寫到 WORKDIR 外（/tmp），權限層有攔下詢問，屬人核准；同 v3 的「a 等同一次性 y，要讀內容」提醒。
+
+## 交付前：閉門會議第 1 輪（docs/review/01-閉門會議-第1輪-20261024.md）
+- 10 位模擬委員，分數 59–76；最低：可重現（證據不出貨）、統計（n=1、混淆）。
+- 作業單 19 項全部採納（必改 15、選改 4）；ask 次數、峰值等數字皆以 log 重算。實驗結論降級為與證據相符（v2 拒絕理由混淆、v3 人為門檻下的機制測試、各實驗 n=1）。
+- requirements 補 httpx2 並固定範圍；乾淨 venv 實跑 `270 passed`。新增 MIT LICENSE；HANDOFF 署名改 @Jadiouo。
+- 使用者決定：GitHub 先 private 再公開；README 中英雙語；repo 名 coding-agent-from-scratch；commit 作者改 noreply、保留歷史、拿掉 session 網址；PROGRESS 與 docs/review 公開＋精選 log 放 evidence/；授權 MIT。
+- 未採納／延後：補跑各實驗 3–5 次（統計委員要求）——先以降級措辭處理，之後可補。

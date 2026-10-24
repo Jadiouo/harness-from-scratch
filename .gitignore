@@ -5,3 +5,4 @@ __pycache__/
 .scratch/
 .env
 .agent/
+.pytest_cache/

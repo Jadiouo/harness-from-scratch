@@ -7,4 +7,4 @@
 ## 指令
 - 測試（安靜版）：`.venv/bin/python -m pytest -q tests/`
 - 執行：`.venv/bin/python agent.py "任務"`（需 `ANTHROPIC_API_KEY`）
-- bash 工具只在 `sandbox/`（`WORKDIR`）裡跑，v2 權限層之前不要改。
+- bash 工具的工作目錄固定在 `sandbox/`（`WORKDIR`）；v2 權限層只是字串規則、不是安全邊界，仍只在丟棄式資料夾跑。

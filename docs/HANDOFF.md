@@ -1,6 +1,6 @@
 # Handoff：自製 Coding Agent（迷你 Claude Code）
 
-Oct 15, 2026 · @Jadio
+Oct 15, 2026 · @Jadiouo
 
 ## 目標與動機
 
@@ -61,7 +61,7 @@ Oct 15, 2026 · @Jadio
 
 ## 目前狀態與下一步
 
-目前只有規劃，還沒有任何程式碼。下一步是寫出 v0。
+（以下是 2026-10-15 開工當天的狀態，保留作歷史；實際進度見 `docs/PROGRESS.md`。）目前只有規劃，還沒有任何程式碼。下一步是寫出 v0。
 
 - [ ] 建 repo、設定 API key（環境變數，不寫進程式碼）
 - [ ] 寫 v0：agent loop + `read_file`、`write_file`、`bash`

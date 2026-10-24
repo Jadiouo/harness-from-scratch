@@ -190,7 +190,7 @@ def read_file(path, offset=1, limit=2000):
 def write_file(path, content):
     p = _path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content)
+    p.write_text(content, encoding="utf-8")
     return f"wrote {len(content.encode())} bytes to {path}"
 
 def edit(path, old_string, new_string, replace_all=False):
