@@ -1,4 +1,4 @@
-"""v3 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層 + 上下文壓縮。不用框架、不用 SDK tool runner。"""
+"""v4 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）。不用框架、不用 SDK tool runner。"""
 import fnmatch, json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +13,8 @@ SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
 先想清楚要做什麼，再動手。工作順序：不熟的程式碼先用 glob/grep 找位置，再 read_file 讀相關段落，再用 edit 做最小修改，最後用 bash 驗證。
 改完或寫完程式後，一定要實際執行（用 bash）驗證結果，不要只憑推測說「應該可以」。
 工具回傳錯誤時，讀懂錯誤訊息並修正，不要重複同一個失敗的動作。
-完成後用簡短的話回報你做了什麼、驗證結果如何。"""
+完成後用簡短的話回報你做了什麼、驗證結果如何。
+WORKDIR/CLAUDE.md 是這個專案的記憶，若有內容會附在下面；學到之後的 session 也該知道的事（例如環境限制），可以提議寫進去。"""
 
 # ==== 【harness 角色：設定】用環境變數決定模型、輪數上限、工作目錄，方便不改程式做實驗 ====
 MODEL = os.environ.get("MODEL", "claude-opus-5-5")
@@ -350,9 +351,46 @@ def new_log_path():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     return LOG_DIR / f"{datetime.now():%Y%m%d-%H%M%S}.jsonl"
 
+# ==== 【harness 角色：專案記憶（CLAUDE.md）】啟動時讀 WORKDIR/CLAUDE.md，附在 system prompt 後面，讓模型跨 session 記得環境限制 ====
+# 只讀 WORKDIR 這一個檔、不往上層找：專案根目錄的 CLAUDE.md 是給開發者的 Claude Code 用的，不是給這個 agent。
+# symlink 解析後若跑出 WORKDIR 也拒載：否則 CLAUDE.md -> 外部檔會把外部內容送上 API（權限層管不到這條路）。
+MAX_MEMORY_CHARS = 4000   # 記憶每輪都會重送，不設上限會悄悄吃掉 context
+
+def load_memory():
+    """回傳 CLAUDE.md 內容；不存在或讀不了回 None（讀不了會印警告）。"""
+    p = WORKDIR / "CLAUDE.md"
+    if not p.is_file():
+        return None
+    if not _inside(p):
+        print(f"[警告] {WORKDIR.name}/CLAUDE.md 指向 WORKDIR 外面，不載入")
+        return None
+    try:
+        text = _read_text(p)
+    except (UnicodeDecodeError, OSError) as e:
+        print(f"[警告] 讀不了 {WORKDIR.name}/CLAUDE.md（{type(e).__name__}），這個 session 不載入記憶")
+        return None
+    if not text.strip():   # 空白檔等於沒有，免得 system 多一個空的記憶標題
+        return None
+    if len(text) > MAX_MEMORY_CHARS:
+        print(f"[警告] {WORKDIR.name}/CLAUDE.md 超過 {MAX_MEMORY_CHARS} 字，已截斷")
+        text = text[:MAX_MEMORY_CHARS] + "\n[... CLAUDE.md 過長，已截斷 ...]"
+    return text
+
+def build_system(memory):
+    if not memory:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n# 專案記憶（WORKDIR/CLAUDE.md，session 開始時載入）\n" + memory
+
+# session 開始時組一次、之後凍結（main 設定；沒經過 main 的測試用預設值，行為和 v3 一樣）。
+# 為什麼凍結：thinking 區塊的簽章綁定「system＋tools＋之前所有訊息」，session 中途重組 system 會 400（v3 摘要請求真實踩到）。
+# 為什麼放 system 而不是第一則 user 訊息：compaction 會把歷史換掉，放在 system 才會自動保留。
+# 代價：session 中途改 CLAUDE.md 要下個 session 才生效。/reset 也不重讀（system 屬於 session，不屬於對話）。
+SESSION_SYSTEM = SYSTEM_PROMPT
+SESSION_MEMORY = None   # /memory 顯示用
+
 # ==== 【harness 角色：request 組裝】把 system、tools、歷史打包成一次 API 呼叫 ====
 def build_request(messages):
-    kwargs = dict(model=MODEL, max_tokens=16000, system=SYSTEM_PROMPT, tools=TOOLS,
+    kwargs = dict(model=MODEL, max_tokens=16000, system=SESSION_SYSTEM, tools=TOOLS,
                   messages=messages, output_config={"effort": EFFORT})
     if USE_FALLBACKS:
         # SDK 1.14.0 的 BetaFallbacksParam 接受 Literal["default"]，所以直接傳字串，不需要 extra_body
@@ -423,13 +461,14 @@ def user_texts(messages):
             out.append(t.removeprefix(USER_PREFIX))
     return out
 
-def _compact_failed(log, turn, reason):
+def _compact_failed(log, turn, reason, system=None):
     # 失敗要退避，也要留 log：之後回頭看才知道為什麼那幾輪沒壓縮
     global COMPACT_COOLDOWN
     COMPACT_COOLDOWN = COMPACT_COOLDOWN_TURNS
     print(f"[警告] {reason}，這次不壓縮")
     with open(log, "a") as f:
-        f.write(json.dumps({"turn": turn, "compaction_failed": {"reason": reason}}, ensure_ascii=False) + "\n")
+        # 記下實際送出的 system：v3 的 400 就是摘要請求失敗，凍結檢查不能漏掉這種
+        f.write(json.dumps({"turn": turn, "compaction_failed": {"reason": reason, "system": system}}, ensure_ascii=False) + "\n")
     return False
 
 def compact(client, messages, log, turn=0):
@@ -457,13 +496,13 @@ def compact(client, messages, log, turn=0):
     try:
         response = client.beta.messages.create(**kwargs)
     except anthropic.APIError as e:
-        return _compact_failed(log, turn, f"摘要請求失敗：{type(e).__name__}: {e}")
+        return _compact_failed(log, turn, f"摘要請求失敗：{type(e).__name__}: {e}", kwargs["system"])
     # 被 max_tokens 截斷的摘要會缺尾巴（通常正是「下一步」），拒絕的回應更不是摘要；寧可不壓縮
     if response.stop_reason != "end_turn":
-        return _compact_failed(log, turn, f"摘要回應 stop_reason={response.stop_reason}")
+        return _compact_failed(log, turn, f"摘要回應 stop_reason={response.stop_reason}", kwargs["system"])
     summary = "".join(b.text for b in response.content if b.type == "text").strip()
     if not summary:
-        return _compact_failed(log, turn, "摘要回應沒有文字")
+        return _compact_failed(log, turn, "摘要回應沒有文字", kwargs["system"])
     texts = user_texts(messages)
     n_before = len(messages)
     # 原地替換：REPL 持有的是同一個 list，換內容才會一起更新
@@ -475,7 +514,7 @@ def compact(client, messages, log, turn=0):
     usage = getattr(response, "usage", None)
     with open(log, "a") as f:
         line = {"turn": turn, "compaction": {"before_tokens": before, "messages_before": n_before, "summary": summary,
-                "compact_at": COMPACT_AT_TOKENS, "user_texts": texts, "summary_usage": usage.model_dump(mode="json") if usage else None}}
+                "compact_at": COMPACT_AT_TOKENS, "system": kwargs["system"], "user_texts": texts, "summary_usage": usage.model_dump(mode="json") if usage else None}}
         f.write(json.dumps(line, ensure_ascii=False, default=to_jsonable) + "\n")
     print(f"🗜 context 壓縮：{before} tokens → 摘要 {len(summary)} 字")
     return True
@@ -601,9 +640,13 @@ def main():
         sys.exit(1)
     client = anthropic.Anthropic()   # 在這裡才建立，沒有 API key 時 import agent 不會爆
     log, messages = new_log_path(), []
-    global LAST_USAGE, COMPACT_COOLDOWN
+    global LAST_USAGE, COMPACT_COOLDOWN, SESSION_SYSTEM, SESSION_MEMORY
     LAST_USAGE = None
     COMPACT_COOLDOWN = 0
+    SESSION_MEMORY = load_memory()
+    SESSION_SYSTEM = build_system(SESSION_MEMORY)
+    if SESSION_MEMORY:
+        print(f"📒 已載入 {WORKDIR.name}/CLAUDE.md（{len(SESSION_MEMORY)} 字）")
     if len(sys.argv) > 1:
         add_user_text(messages, " ".join(sys.argv[1:]))
         try:
@@ -630,6 +673,10 @@ def main():
                 LAST_USAGE = None
             else:
                 print("沒有壓縮（歷史是空的、尾端有未配對的 tool_use，或摘要失敗）")
+            continue
+        if text == "/memory":
+            print(SESSION_MEMORY or "本 session 沒有載入 CLAUDE.md")
+            print("（修改 CLAUDE.md 要下次啟動才生效）")
             continue
         if text == "/tokens":
             u = LAST_USAGE

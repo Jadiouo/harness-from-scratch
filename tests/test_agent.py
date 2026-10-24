@@ -40,6 +40,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SESSION_ALLOW", set())
     monkeypatch.setattr(agent, "LAST_USAGE", None)
     monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 0)
+    monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.SYSTEM_PROMPT)   # main 會改它；測完還原，避免測試間污染
+    monkeypatch.setattr(agent, "SESSION_MEMORY", None)
     monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)   # 預設值是給真實測驗用的 8000；單元測試用固定值
     return tmp_path
 
@@ -1127,3 +1129,180 @@ def test_summarize_tolerates_unknown_and_new_lines(tmp_path, capsys):
     summarize_log.main([str(p)])
     out = capsys.readouterr().out
     assert "compaction 失敗" in out and "max_tokens" in out
+
+
+# ---- v4：專案記憶（CLAUDE.md）----
+def test_load_memory_missing_and_normal(env):
+    assert agent.load_memory() is None
+    (agent.WORKDIR / "CLAUDE.md").write_text("用 python3\n", encoding="utf-8")
+    assert agent.load_memory() == "用 python3\n"
+
+def test_load_memory_truncates_with_marker(env, capsys):
+    (agent.WORKDIR / "CLAUDE.md").write_text("字" * (agent.MAX_MEMORY_CHARS + 50), encoding="utf-8")
+    m = agent.load_memory()
+    assert m.startswith("字" * agent.MAX_MEMORY_CHARS) and m.endswith("[... CLAUDE.md 過長，已截斷 ...]")
+    assert "字" * (agent.MAX_MEMORY_CHARS + 1) not in m and "已截斷" in capsys.readouterr().out
+
+def test_load_memory_non_utf8_returns_none(env, capsys):
+    (agent.WORKDIR / "CLAUDE.md").write_bytes(b"\xff\xfe\x00bad")
+    assert agent.load_memory() is None
+    assert "[警告]" in capsys.readouterr().out
+
+def test_load_memory_ignores_parent_dir(env):
+    (agent.WORKDIR.parent / "CLAUDE.md").write_text("上一層的，不該被讀到", encoding="utf-8")
+    assert agent.load_memory() is None
+
+def test_load_memory_blank_file_is_none(env):
+    (agent.WORKDIR / "CLAUDE.md").write_text("  \n\n", encoding="utf-8")
+    assert agent.load_memory() is None
+
+def test_load_memory_directory_is_none(env):
+    (agent.WORKDIR / "CLAUDE.md").mkdir()
+    assert agent.load_memory() is None
+
+def test_load_memory_symlink_outside_rejected_inside_ok(env, capsys):
+    out = agent.WORKDIR.parent / "outside.txt"
+    out.write_text("外部機密", encoding="utf-8")
+    link = agent.WORKDIR / "CLAUDE.md"
+    link.symlink_to(out)
+    assert agent.load_memory() is None and "指向 WORKDIR 外面" in capsys.readouterr().out
+    assert "外部機密" not in agent.build_system(agent.load_memory())
+    link.unlink()
+    (agent.WORKDIR / "real.md").write_text("內部記憶", encoding="utf-8")
+    link.symlink_to(agent.WORKDIR / "real.md")
+    assert agent.load_memory() == "內部記憶"
+
+def test_build_request_system_with_and_without_memory(env, monkeypatch):
+    assert agent.build_request([])["system"] == agent.SYSTEM_PROMPT   # 沒經過 main：和 v3 一樣
+    assert agent.build_system(None) == agent.SYSTEM_PROMPT
+    monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.build_system("一律用 python3"))
+    s = agent.build_request([])["system"]
+    assert s.startswith(agent.SYSTEM_PROMPT) and "# 專案記憶" in s and s.endswith("一律用 python3")
+
+def test_system_identical_across_turns_and_summary_request(env, monkeypatch):
+    monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.build_system("記憶內容"))
+    monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 100)
+    script = [msg([tool("a", "bash", command="echo 1")], "tool_use", usage=(500, 10)),
+              msg([text("S")], "end_turn"),   # 壓縮的摘要請求
+              msg([tool("b", "bash", command="echo 2")], "tool_use", usage=(50, 10)),
+              msg([text("done")], "end_turn", usage=(50, 10))]
+    client, _, log = run(script, env)
+    assert len(client.calls) == 4 and client.calls[1]["tool_choice"] == {"type": "none"}
+    assert {c["system"] for c in client.calls} == {agent.SESSION_SYSTEM}
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    assert all(r["request"]["system"] == agent.SESSION_SYSTEM for r in rows if "request" in r)
+    assert next(r for r in rows if "compaction" in r)["compaction"]["system"] == agent.SESSION_SYSTEM
+
+def test_main_loads_memory_and_memory_command_and_reset(env, monkeypatch, capsys):
+    (agent.WORKDIR / "CLAUDE.md").write_text("一律用 python3", encoding="utf-8")
+    seen = []
+    inputs = iter(["/memory", "/reset", "/memory", "/exit"])
+    def fake_input(prompt=""):
+        seen.append(agent.SESSION_SYSTEM)   # 每次讀輸入時記下目前的 system
+        return next(inputs)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setattr(agent, "load_env", lambda: None)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda: FakeClient([]))
+    monkeypatch.setattr(sys, "argv", ["agent.py"])
+    monkeypatch.setattr("builtins.input", fake_input)
+    agent.main()
+    out = capsys.readouterr().out
+    assert f"📒 已載入 {agent.WORKDIR.name}/CLAUDE.md（{len('一律用 python3')} 字）" in out
+    assert out.count("一律用 python3\n") == 2 and out.count("下次啟動才生效") == 2
+    assert len(set(seen)) == 1 and "一律用 python3" in seen[0]   # /reset 後 system 沒變
+
+def test_main_without_memory_prints_nothing_and_memory_says_none(env, monkeypatch, capsys):
+    repl(monkeypatch, FakeClient([]), ["/memory", "/exit"])
+    out = capsys.readouterr().out
+    assert "📒" not in out and "本 session 沒有載入 CLAUDE.md" in out
+
+def test_main_reset_keeps_session_system_with_memory(env, monkeypatch):
+    (agent.WORKDIR / "CLAUDE.md").write_text("記憶XYZ", encoding="utf-8")
+    seen = []
+    inputs = iter(["/reset", "/exit"])
+    def fake_input(prompt=""):
+        seen.append(agent.SESSION_SYSTEM)
+        return next(inputs)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setattr(agent, "load_env", lambda: None)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda: FakeClient([]))
+    monkeypatch.setattr(sys, "argv", ["agent.py"])
+    monkeypatch.setattr("builtins.input", fake_input)
+    agent.main()
+    assert seen[0] == seen[1] == agent.SESSION_SYSTEM != agent.SYSTEM_PROMPT and "記憶XYZ" in seen[0]
+
+def test_main_ignores_claude_md_above_workdir(env, monkeypatch, capsys):
+    (agent.WORKDIR.parent / "CLAUDE.md").write_text("上一層的", encoding="utf-8")
+    repl(monkeypatch, FakeClient([]), ["/exit"])
+    assert "📒" not in capsys.readouterr().out and "上一層的" not in agent.SESSION_SYSTEM
+
+
+# ---- v4：summarize_log 的顯示修正與記憶判定 ----
+def fake_rows(tmp_path, rows):
+    p = tmp_path / "v4.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    return p
+
+def req_row(i, system, cmd=None):
+    content = [{"type": "tool_use", "id": f"t{i}", "name": "bash", "input": {"command": cmd}}] if cmd else []
+    return {"turn": i, "request": {"system": system, "messages": []},
+            "response": {"stop_reason": "tool_use" if cmd else "end_turn", "content": content}}
+
+MEM_SYS = agent.build_system("一律用 python3")
+
+def v4_out(mod, p, capsys):
+    mod.main([str(p)])
+    return capsys.readouterr().out
+
+def test_v2_block_hidden_without_refusal_shown_with_n(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    perm = lambda ans: {"turn": 1, "permission": {"id": "t1", "tool": "bash", "input": {"command": "x"},
+                                                  "decision": "ask", "answer": ans, "reason": "r"}}
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, "S", "ls"), perm("y")]), capsys)
+    assert "v2 完成標準判定" not in out
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, "S", "ls"), perm("n")]), capsys)
+    assert "v2 完成標準判定" in out
+
+def test_v4_judge_pass_when_python3_first(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "python3 hello.py"), req_row(2, MEM_SYS)]), capsys)
+    assert "v4-記憶判定" in out and "❌" not in out.split("v4-記憶判定")[1] and out.count("✅ PASS") == 2
+    assert "一律用 python3" in out   # 第 3 項：記憶前 200 字
+
+def test_v4_judge_fail_when_bare_python_first(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "python hello.py"),
+                                           req_row(2, MEM_SYS, "python3 hello.py")]), capsys)
+    assert "❌ FAIL 2." in out and "✅ PASS 1." in out
+
+def test_v4_judge_fail_when_system_changes(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "python3 a.py"), req_row(2, MEM_SYS + "!")]), capsys)
+    assert "❌ FAIL 1." in out
+
+def test_v4_judge_covers_compaction_system_and_na_without_python(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    comp = {"turn": 2, "compaction": {"before_tokens": 1, "messages_before": 1, "summary": "s", "system": "別的 system"}}
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "ls"), comp]), capsys)
+    assert "❌ FAIL 1." in out and "不適用" in out
+
+def test_v4_judge_covers_failed_compaction_system(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    bad = {"turn": 2, "compaction_failed": {"reason": "400", "system": "別的 system"}}
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "ls"), bad]), capsys)
+    assert "❌ FAIL 1." in out
+    old = {"turn": 2, "compaction_failed": {"reason": "舊 log"}}
+    out = v4_out(mod, fake_rows(tmp_path, [req_row(1, MEM_SYS, "ls"), old]), capsys)
+    assert "未涵蓋 1 次（含失敗 1 次）" in out
+
+def test_compact_failed_logs_system(env, monkeypatch):
+    monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.build_system("m"))
+    client = FakeClient([msg([text("S")], "max_tokens")])
+    log = agent.new_log_path()
+    assert agent.compact(client, [{"role": "user", "content": "hi"}], log, 1) is False
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    assert rows[0]["compaction_failed"]["system"] == agent.SESSION_SYSTEM
+
+def test_v4_block_absent_without_memory(tmp_path, capsys):
+    mod, _, _ = judge_setup(tmp_path)
+    assert "v4-記憶判定" not in v4_out(mod, fake_rows(tmp_path, [req_row(1, agent.SYSTEM_PROMPT, "ls")]), capsys)

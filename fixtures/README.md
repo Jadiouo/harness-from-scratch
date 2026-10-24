@@ -27,3 +27,15 @@ rm -rf sandbox/docstring_repo && cp -r fixtures/docstring_repo sandbox/
 詢問時建議回答：第一次 edit 回 `a`（本 session 允許 edit）；bash 的 `python3 check_docstrings.py` 詢問時回 `a`。
 
 門檻：`COMPACT_AT_TOKENS` 預設 8000（fixture 全部只有約 6.8k 字元，門檻太高會不觸發壓縮）；`summarize_log.py` 優先用 log 裡記錄的 `compact_at`，舊 log 才用 `--compact-at`（預設 8000）。
+
+## v4-記憶實驗（CLAUDE.md 自動載入）
+`fixtures/memory/CLAUDE.md` 一句話：這台機器沒有 `python`，一律用 `python3`。
+
+```bash
+cp fixtures/memory/CLAUDE.md sandbox/CLAUDE.md
+.venv/bin/python agent.py "建立 hello.py 並執行"
+.venv/bin/python scripts/summarize_log.py
+rm sandbox/CLAUDE.md   # 做完移除，避免影響其他測驗
+```
+預期：啟動時印 `📒 已載入 sandbox/CLAUDE.md`，第一次 bash 就用 `python3`；`summarize_log.py` 的「v4-記憶判定」三項都過。
+對照組：`logs/20261015-225449.jsonl`（v0 那次，沒有記憶）第一次用了 `python`、exit 127 後才改 `python3`。

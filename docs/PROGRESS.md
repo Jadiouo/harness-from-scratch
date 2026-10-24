@@ -116,3 +116,21 @@
   - **壓縮時機吃掉剛讀的內容**：第 4 輪讀了 6 個 geometry 檔 → 壓縮 → 第 5 輪原樣重讀同 6 檔；第 14 輪跑 check → 壓縮 → 第 15 輪重跑。原因：壓縮發生在 tool_result 剛回來之後，摘要裝不下檔案內容。可能改法：保留最後一輪的 tool_result（需剝掉被保留輪的 thinking，見 keep-tail 規則）、或在讀檔前預估觸發。
   - 模型自動改成「一批讀 6 檔→一批改」的節奏，剛好和壓縮週期對齊。
   - v2 判定區塊在沒有任何 n 時也印出 FAIL，屬顯示問題（只該在有拒絕時判定）。
+
+## v4-1 專案記憶（CLAUDE.md 自動載入）
+- 設計（定案）：只讀 `WORKDIR/CLAUDE.md`（不往上層找）；session 開始時接在 system 後面、之後凍結（thinking 簽章綁定 system，中途重組會 400，見 v3 第 1 次）；放 system 而非第一則 user 訊息，壓縮時自動保留。代價：中途改 CLAUDE.md 要下次啟動才生效；/reset 不重讀。上限 4000 字。REPL `/memory`。
+- 順手修：summarize_log 的 v2 判定只在有 n 或 deny 時才印。
+
+### v4-1 審查第 1 輪（sonnet，乾淨上下文）
+- 驗證：pytest `169 passed`；指揮官確認 SESSION_SYSTEM 只在 main 設定一次。
+- 必改（皆採納）：
+  1. load_memory 跟著 symlink 讀 WORKDIR 外的檔（實測會把外部內容送上 API）→ 用 `_inside()` 拒載。
+  2. judge_v4 沒涵蓋**失敗**的摘要請求（v3 的 400 正是這種）→ `compaction_failed` 也記 system 並納入比對。
+- 建議（皆採納）：空白檔視為沒有；目錄測試；刪空洞斷言改經 main 的 /reset 測試；docs「模型較重視 system」標假設。
+- 修正後驗證：pytest `175 passed`；指揮官實測 symlink 指向 `.scratch/` 外部檔 → 印警告、回 None。無必改項，進真實測驗。
+- 真實測驗見下節。
+
+### v4-1 真實測驗（同一版程式，只差有沒有 sandbox/CLAUDE.md）— 通過
+- 有記憶（logs/v4-mem-with.jsonl）：第 1 輪就 `python3 hello.py`，2 輪完成；v4 判定全 PASS（system 2 個請求皆相同）。
+- 對照組無記憶（logs/v4-mem-control.jsonl）：第 2 輪 `python hello.py` 失敗，第 3 輪才 `python3`，4 輪完成。
+- 結論：CLAUDE.md 確實省掉一次「重新發現環境限制」的試錯。樣本各 1 次，屬示範而非統計。

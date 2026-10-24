@@ -1,4 +1,4 @@
-"""把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1／v2 完成標準。
+"""把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1／v2／v3／v4 完成標準。
 用法：summarize_log.py [log路徑] [--repo sandbox/mini_repo] [--fixture fixtures/mini_repo]"""
 import argparse, difflib, json, os, posixpath, re, subprocess, sys
 from collections import Counter
@@ -173,6 +173,33 @@ def judge_v3(path, repo, fixture, compact_at):
                 "每次 compaction：" + "；".join(ba) if ba else ""))
     return res
 
+# ==== v4：專案記憶判定。只在第一個 request 的 system 含「# 專案記憶」時才有意義 ====
+MEMORY_MARK = "# 專案記憶"
+BARE_PYTHON = re.compile(r"(?<![\w./-])python(?![\w.-])")   # 單獨的 python；python3、/usr/bin/python3 不算
+
+def judge_v4(path):
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    systems = [d["request"]["system"] for d in rows if "system" in d.get("request", {})]
+    if not systems or MEMORY_MARK not in str(systems[0]):
+        return None
+    cs = [d[k] for d in rows for k in ("compaction", "compaction_failed") if k in d]   # 失敗的摘要請求也會送 system
+    comp = [c["system"] for c in cs if "system" in c]
+    drift = [i for i, x in enumerate(systems + comp, 1) if x != systems[0]]
+    note = f"（含 {len(comp)} 個摘要請求）" if comp else ""
+    if len(cs) > len(comp):
+        miss_fail = sum(1 for d in rows if "compaction_failed" in d and "system" not in d["compaction_failed"])
+        note += f"（未涵蓋 {len(cs) - len(comp)} 次（含失敗 {miss_fail} 次）：舊 log 沒記 system）"
+    res = [(not drift, f"1. 每個 request 的 system 都與第一個相同（共 {len(systems) + len(comp)} 個）{note}",
+            f"第 {drift} 個不同" if drift else "")]
+    cmds = [b["input"].get("command", "") for d in rows for b in d.get("response", {}).get("content", [])
+            if b.get("type") == "tool_use" and b["name"] == "bash"]
+    first = next((c for c in cmds if "python" in c), None)
+    if first is None:
+        res.append((True, "2. 第一次含 python 的 bash 指令用 python3：不適用（沒有 python 指令）", ""))
+    else:
+        res.append((not BARE_PYTHON.search(first), "2. 第一次含 python 的 bash 指令用 python3", f"指令：{first[:100]}"))
+    return res
+
 def forgot_after_compaction(path):
     """6（觀察，不判 FAIL；都是近似判斷）。以 tool_result 行判斷 edit 是否成功（壓縮後 request 裡的結果已被換掉）。
     reread：壓縮前已成功 edit 過 F、壓縮後又 read_file F，而且之後沒再成功 edit F（只是重讀確認，代表不確定 F 做完沒）。
@@ -225,11 +252,12 @@ def main(argv):
     print(f"log: {path}")
     counts, seen, rewrites = Counter(), set(), []
     tin = tout = 0
-    has_perm = False
+    refused = False   # 有任何「使用者回 n」或 deny 才有 v2 可判定的東西
     for line in path.read_text().splitlines():
         d = json.loads(line)
         if "permission" in d:
-            p, has_perm = d["permission"], True
+            p = d["permission"]
+            refused = refused or p.get("answer") == "n" or p.get("decision") == "deny"
             print(f"    [{p['decision']}{'→' + p['answer'] if p.get('answer') else ''} {p['tool']} {brief(p.get('input', {}))}]")
             continue
         if "tool_result" in d:   # 只供判定使用，不印
@@ -271,7 +299,7 @@ def main(argv):
     print(f"總 tokens: input={tin} output={tout} total={tin + tout}")
 
     calls, errors = load_calls(path)
-    if has_perm:   # v2 判定不受下面 v1 防呆影響
+    if refused:   # v2 判定不受下面 v1 防呆影響；沒有拒絕時第 1、3 項必然 FAIL，印出來會誤導
         print("--- v2 完成標準判定 ---")
         res2 = judge_v2(path)
         for ok, label, detail in res2:
@@ -279,6 +307,16 @@ def main(argv):
             if detail:
                 print("    " + detail.replace("\n", "\n    "))
         print("結果:", "全部通過" if all(ok for ok, _, _ in res2) else "有未通過項目")
+    res4 = judge_v4(path)
+    if res4:
+        print("--- v4-記憶判定 ---")
+        for ok, label, detail in res4:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        mem = next(d["request"]["system"] for l in path.read_text().splitlines() if "system" in (d := json.loads(l)).get("request", {}))
+        print("3. 載入的記憶（前 200 字）：" + mem.split(MEMORY_MARK, 1)[1].split("\n", 1)[-1][:200].replace("\n", " "))
+        print("結果:", "全部通過" if all(ok for ok, _, _ in res4) else "有未通過項目")
     if "docstring_repo" in path.read_text():   # v3 判定不受下面 v1 防呆影響
         print("--- v3 完成標準判定 ---")
         v3repo, v3fx = (Path(p) if Path(p).is_absolute() else ROOT / p for p in (args.v3_repo, args.v3_fixture))
