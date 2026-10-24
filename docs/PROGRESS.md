@@ -225,3 +225,22 @@
 ## 改名與收尾（使用者決定）
 - repo 改名 harness-from-scratch（使用者：目的是了解 harness 的流程，「coding agent」不貼切）；README 標題與定位句改成以 harness 為主。上面歷史紀錄中的舊名保留不改。
 - 不補跑各實驗 3–5 次（使用者：目的是理解 harness 流程，n=1 的示範已足夠；README 已標明 n=1）。專案至此完成。
+
+## 結案（2026-10-24）
+**狀態：完成，已公開** — https://github.com/Jadiouo/harness-from-scratch（topics：agent-harness、agent-loop、anthropic、claude、coding-agent、llm-agents、python）。
+
+**做了什麼（v0–v4，皆以完成標準驗證）**
+- v0 最小 agent loop（read_file／write_file／bash）；v1 edit／grep／glob；v2 權限層（allow／ask／deny＋同批略過）；v3 client-side compaction；v4 專案記憶（CLAUDE.md 進 system 並凍結）、TODO 工具、唯讀 subagent、pre/post hooks。
+- 270 個離線測試（FakeClient，不打 API）；14 份去識別化實驗 log 在 evidence/logs/，可用 summarize_log 重播。
+- 交付前閉門會議 1 輪（10 位模擬委員，作業單 19 項全採納），中英雙語 README。
+
+**最重要的學到的事**
+1. thinking 簽章綁定同一段對話的 system＋tools＋先前訊息：session 中途改 system 會 400 → system 在 session 開始時定稿、摘要請求沿用同一份。
+2. 同一批 tool_use 是一起規劃的：拒絕一個就略過後面的，各回 is_error 保持配對，讓模型重新規劃。
+3. subagent 省的是主對話 context（峰值 −4 成），不是錢（總 token ＋2 成）。
+4. 工具描述有時就夠（v1 bash 描述一句改變選擇），有時不夠（TODO 只靠描述 0 次使用，system prompt 一句才用）。
+5. 所有對照實驗 n=1，屬示範；使用者決定不補跑（目的是理解 harness 流程）。
+
+**本機狀態**：只剩 main（與 origin 同步）；改寫前的備份分支與舊歷史已刪除並 gc；快取、sandbox/ 已清（sandbox 下次執行自動重建）。保留 .venv（52MB，可刪、`pip install -r requirements.txt` 重建）、logs/（原始 log，evidence 由此產生）、.env（API key，gitignore）。
+
+**若日後重開，可能的下一步**（皆未做）：串流輸出、真正的 OS sandbox、keep-tail 壓縮（需剝除保留輪的 thinking）、bash 前綴規則以減少核准疲勞、Ctrl-C 中斷時的批次回滾。
