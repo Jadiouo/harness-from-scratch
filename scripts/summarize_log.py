@@ -1,4 +1,4 @@
-"""把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1 完成標準。
+"""把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1／v2 完成標準。
 用法：summarize_log.py [log路徑] [--repo sandbox/mini_repo] [--fixture fixtures/mini_repo]"""
 import argparse, difflib, json, os, posixpath, re, subprocess, sys
 from collections import Counter
@@ -22,7 +22,7 @@ def load_calls(path):
     calls, errors, seen = [], {}, set()
     for line in path.read_text().splitlines():
         d = json.loads(line)
-        for m in d["request"].get("messages", []):
+        for m in d.get("request", {}).get("messages", []):   # permission 行沒有 request
             if isinstance(m.get("content"), list):
                 for b in m["content"]:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
@@ -95,6 +95,35 @@ def strings(inp):
     # 寫入內容與搜尋樣式可能合理地提到這些字，不算存取
     return (v for k, v in inp.items() if isinstance(v, str) and k not in ("content", "old_string", "new_string", "pattern"))
 
+# ==== v2：權限層判定。拒絕 = 使用者回 n，或權限層 deny ====
+def judge_v2(path):
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    perms = {d["permission"].get("id"): d["permission"] for d in rows if "permission" in d}
+    seq, texts = [], []   # seq: (tool_use, 它所在回應的序號)；texts: 每個回應裡的 text
+    for d in rows:
+        if "response" not in d:
+            continue
+        content = d["response"].get("content", [])
+        texts.append([b["text"] for b in content if b.get("type") == "text" and b.get("text", "").strip()])
+        seq += [(b, len(texts) - 1) for b in content if b.get("type") == "tool_use"]
+    key = lambda b: (b["name"], json.dumps(b.get("input"), sort_keys=True))
+    refused = [k for k, (b, _) in enumerate(seq)
+               if perms.get(b["id"], {}).get("decision") == "deny" or perms.get(b["id"], {}).get("answer") == "n"]
+    res = [(any(p.get("decision") == "ask" and p.get("answer") == "n" for p in perms.values()),
+            "1. 至少一次 ask 被回 n", "")]
+    same_next = [seq[k][0]["name"] for k in refused if k + 1 < len(seq) and key(seq[k + 1][0]) == key(seq[k][0])]
+    res.append((not same_next, "2. 被拒絕後，下一個工具呼叫不是原樣重試", f"原樣重試: {same_next}" if same_next else ""))
+    stuck, shown = [], []
+    for k in refused:
+        later = [t for ts in texts[seq[k][1] + 1:] for t in ts]
+        if k + 1 >= len(seq) and not later:
+            stuck.append(seq[k][0]["name"])
+        shown.append(f"拒絕 {seq[k][0]['name']}({brief(seq[k][0].get('input', {}))}) 之後模型第一段 text：" + (later[0][:300] if later else "(無)"))
+    res.append((not stuck and bool(refused), "3. 被拒絕後模型有後續動作或文字回覆（改走別的路與否：需人工確認）", "\n".join(shown)))
+    spam = [seq[k][0]["name"] for k in refused if sum(key(b) == key(seq[k][0]) for b, _ in seq[k + 1:]) > 1]
+    res.append((not spam, "4. 沒有任何被拒絕的操作被原樣重試超過 1 次", f"重試過多: {spam}" if spam else ""))
+    return res
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("log", nargs="?")
@@ -106,8 +135,13 @@ def main(argv):
     print(f"log: {path}")
     counts, seen, rewrites = Counter(), set(), []
     tin = tout = 0
+    has_perm = False
     for line in path.read_text().splitlines():
         d = json.loads(line)
+        if "permission" in d:
+            p, has_perm = d["permission"], True
+            print(f"    [{p['decision']}{'→' + p['answer'] if p.get('answer') else ''} {p['tool']} {brief(p.get('input', {}))}]")
+            continue
         if "error" in d:
             print(f"#{d['turn']} ERROR {d['error']['type']}: {d['error']['message']}")
             continue
@@ -134,12 +168,20 @@ def main(argv):
     print(f"總 tokens: input={tin} output={tout} total={tin + tout}")
 
     calls, errors = load_calls(path)
+    if has_perm:   # v2 判定不受下面 v1 防呆影響
+        print("--- v2 完成標準判定 ---")
+        res2 = judge_v2(path)
+        for ok, label, detail in res2:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        print("結果:", "全部通過" if all(ok for ok, _, _ in res2) else "有未通過項目")
     # 沒成功呼叫 API 時不會有新 log，latest_log() 會默默撿到舊任務的 log，判定結果看似有效但不是這次的
     if repo.is_dir() and repo.stat().st_mtime > path.stat().st_mtime:
-        print(f"⚠ 最新的 log（{path.name}）比 repo 的複製時間還舊——這次執行可能沒有成功呼叫 API，請看終端機輸出")
+        print(f"⚠ 最新的 log（{path.name}）比 repo 的複製時間還舊——這次執行可能沒有成功呼叫 API，請看終端機輸出（v1 判定略過）")
         return 2
     if not any("mini_repo" in str(v) for c in calls for v in c.get("input", {}).values()):
-        print("⚠ 這份 log 看起來不是 mini_repo 測驗，不做判定")
+        print("⚠ 這份 log 看起來不是 mini_repo 測驗，不做 v1 判定")
         return 2
     print("--- v1 完成標準判定 ---")
     res = judge(calls, errors, repo, fixture)

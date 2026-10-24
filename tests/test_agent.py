@@ -35,6 +35,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "WORKDIR", tmp_path / "sb")
     agent.WORKDIR.mkdir()
     monkeypatch.setattr(agent, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(agent, "PERMISSION_MODE", "allow_all")   # v1 的測試不關心權限；v2 的測試用 ask_env 改回 ask
+    monkeypatch.setattr(agent, "SESSION_ALLOW", set())
     return tmp_path
 
 def run(script, env, user="go", messages=None):
@@ -98,7 +100,7 @@ def test_max_turns_then_repl_append(env, monkeypatch):
 def test_log(env):
     script = [msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")]
     _, _, log = run(script, env)
-    lines = log.read_text().splitlines()
+    lines = [l for l in log.read_text().splitlines() if "permission" not in l]   # permission 行另外測
     assert len(lines) == 2
     for i, l in enumerate(lines, 1):
         d = json.loads(l)
@@ -433,3 +435,234 @@ def test_bash_cannot_see_api_key(env, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
     out = agent.bash("echo key=$ANTHROPIC_API_KEY")
     assert "sk-ant-secret" not in out and "key=\n" in out
+
+
+# ==== v2：權限層 ====
+@pytest.fixture
+def ask_env(env, monkeypatch):
+    monkeypatch.setattr(agent, "PERMISSION_MODE", "ask")
+    def answers(*seq):
+        asked, it = [], iter(seq)
+        def prompt(q):
+            asked.append(q)
+            a = next(it)
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        monkeypatch.setattr(agent, "PROMPT", prompt)
+        return asked
+    return answers
+
+@pytest.mark.parametrize("name,args,want", [
+    ("read_file", {"path": "a.py"}, "allow"),
+    ("grep", {"pattern": "x"}, "allow"),
+    ("glob", {"pattern": "**/*.py"}, "allow"),
+    ("read_file", {"path": "../x"}, "deny"),
+    ("read_file", {"path": "/etc/passwd"}, "deny"),
+    ("grep", {"pattern": "x", "path": "sub/../.."}, "deny"),
+    ("glob", {"pattern": "../*"}, "deny"),
+    ("glob", {"pattern": "/etc/*"}, "deny"),
+    ("write_file", {"path": "../x", "content": "1"}, "deny"),
+    ("write_file", {"path": "a.py", "content": "1"}, "ask"),
+    ("edit", {"path": "a.py", "old_string": "a", "new_string": "b"}, "ask"),
+    ("bash", {"command": "ls"}, "allow"),
+    ("bash", {"command": "pwd"}, "allow"),
+    ("bash", {"command": "cat mini_repo/check.py"}, "allow"),
+    ("bash", {"command": "grep -rn total mini_repo"}, "allow"),
+    ("bash", {"command": "cd mini_repo && ls"}, "allow"),
+    ("bash", {"command": "cd mini_repo && python3 check.py"}, "ask"),
+    ("bash", {"command": "ls | wc -l"}, "allow"),
+    ("bash", {"command": "rm -rf x"}, "ask"),
+    ("bash", {"command": "echo hi > f"}, "ask"),
+    ("bash", {"command": "echo $(whoami)"}, "ask"),
+    ("bash", {"command": "ls && curl x"}, "ask"),
+    ("bash", {"command": "python3 -c 'x'"}, "ask"),
+    ("bash", {"command": "find . -delete"}, "ask"),
+    ("bash", {"command": "find . -exec rm {} ;"}, "ask"),
+    ("bash", {"command": "curl x"}, "ask"),
+])
+def test_check_permission_rules(ask_env, name, args, want):
+    decision, reason = agent.check_permission(name, args)
+    assert decision == want and reason
+    if want == "deny":
+        assert "路徑在工作目錄之外" in reason
+
+# 紅方實測的繞過：全部必須不是 allow
+BYPASSES = [
+    "cat ../.env", "head /etc/passwd", "grep -r API ..", "diff ../.env x", "cd .. && cat .env",
+    "cd ~; cat .env", "cat $HOME/.env", "cat ../.e*", "cat .*/.env", "ls -R /",   # 1 讀 WORKDIR 外
+    "ls\nrm -rf x", "ls & rm x",                                                   # 2 分隔符
+    "env rm -rf x",                                                                 # 3
+    "find . -fprint ../x", "find . -fls ../x", "find . -fprintf ../x %p",           # 4
+    "python3 evil.py", "python3 -m pip install x", "python3 -Sc 1", "pytest -p evil",   # 5
+    "ls\u00a0&& rm x", "ls\x0brm x", "ls\x0crm x", "cat\u00a0../.env", "ls\trm x",   # 6 空白字元不一致
+    "cat --include=/etc/passwd x", "cd", "cd a b", "ls &&& rm x", "ls ||| rm x", "",
+]
+
+@pytest.mark.parametrize("cmd", BYPASSES)
+def test_bash_bypasses_not_allowed(ask_env, cmd):
+    assert agent.check_permission("bash", {"command": cmd})[0] in ("ask", "deny")
+
+def test_grep_does_not_follow_symlinks(env, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("API_KEY=1\n")
+    put("real.txt", "API_KEY=2\n")
+    (agent.WORKDIR / "link_file").symlink_to(outside / "secret.txt")
+    (agent.WORKDIR / "link_dir").symlink_to(outside, target_is_directory=True)
+    assert call("grep", pattern="API_KEY")["content"] == "real.txt:1: API_KEY=2"
+
+def test_glob_hides_symlink_targets_outside(env, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("x")
+    put("real.txt", "x")
+    (agent.WORKDIR / "link_file").symlink_to(outside / "secret.txt")
+    (agent.WORKDIR / "link_dir").symlink_to(outside, target_is_directory=True)
+    assert call("glob", pattern="**/*")["content"] == "real.txt"
+    assert call("glob", pattern="link_dir/*")["content"] == "沒有符合的檔案"
+
+def test_file_tools_deny_symlink_escape(ask_env, tmp_path):
+    (tmp_path / "secret.txt").write_text("x")
+    (agent.WORKDIR / "link").symlink_to(tmp_path / "secret.txt")
+    for name, args in (("read_file", {"path": "link"}), ("write_file", {"path": "link", "content": "1"}),
+                       ("edit", {"path": "link", "old_string": "x", "new_string": "y"}), ("grep", {"pattern": "x", "path": "link"})):
+        assert agent.check_permission(name, args)[0] == "deny"
+
+def test_nul_in_args_is_denied_not_crash(ask_env):
+    asked = ask_env()
+    for name, args in (("read_file", {"path": "a\x00b"}), ("write_file", {"path": "a\x00b", "content": "1"}),
+                       ("grep", {"pattern": "x", "path": "a\x00b"})):
+        result, perm = agent.authorize(tool("n", name, **args))
+        assert perm["decision"] == "deny" and "參數無法判斷" in result["content"] and result["is_error"]
+    assert asked == []
+
+def test_bash_always_allow_only_same_command(ask_env):
+    asked = ask_env("a", "n", "")
+    script = [msg([tool("a", "bash", command="touch x.txt")], "tool_use"),
+              msg([tool("b", "bash", command="touch x.txt")], "tool_use"),
+              msg([tool("c", "bash", command="rm -rf x.txt")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    run(script, None)
+    assert len(asked) == 3 and "不再詢問這條完全相同的指令" in asked[0]   # 第一次 a、第三條 rm 問了 n 和理由
+    assert agent.SESSION_ALLOW == {("bash", "touch x.txt")}
+    assert agent.check_permission("bash", {"command": "touch y.txt"})[0] == "ask"
+
+def test_file_tool_always_allow_prompt_text(ask_env):
+    asked = ask_env("y")
+    run([msg([tool("a", "write_file", path="1.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], None)
+    assert "都允許 這個工具（仍限工作目錄內）" in asked[0]
+
+def test_permission_mode_is_normalized():
+    import subprocess
+    r = subprocess.run([sys.executable, "-c", "import agent; print(agent.PERMISSION_MODE)"], capture_output=True, text=True,
+                       env={**os.environ, "PERMISSION_MODE": " Allow_All ", "WORKDIR": str(Path(agent.__file__).parent / "sandbox")},
+                       cwd=Path(agent.__file__).parent)
+    assert r.stdout.strip() == "allow_all"
+
+def test_denied_then_other_tool(ask_env):
+    put("a.py", "x = 1\n")
+    asked = ask_env("n", "先別改")
+    script = [msg([tool("a", "edit", path="a.py", old_string="x = 1", new_string="x = 2")], "tool_use"),
+              msg([tool("b", "read_file", path="a.py")], "tool_use"),
+              msg([text("好，先列計畫")], "end_turn")]
+    _, messages, log = run(script, None)
+    r1, r2 = messages[2]["content"][0], messages[4]["content"][0]
+    assert r1["is_error"] is True and "先別改" in r1["content"] and "沒有被執行" in r1["content"]
+    assert (agent.WORKDIR / "a.py").read_text() == "x = 1\n"
+    assert "is_error" not in r2 and "x = 1" in r2["content"]
+    check_pairing(messages)
+    perms = [json.loads(l)["permission"] for l in log.read_text().splitlines() if "permission" in l]
+    assert [(p["tool"], p["decision"], p["answer"]) for p in perms] == [("edit", "ask", "n"), ("read_file", "allow", None)]
+    assert "先別改" in perms[0]["reason"] and len(asked) == 2
+
+def test_yes_executes(ask_env):
+    ask_env("Y")
+    _, messages, _ = run([msg([tool("a", "write_file", path="n.txt", content="1")], "tool_use"),
+                          msg([text("ok")], "end_turn")], None)
+    assert (agent.WORKDIR / "n.txt").read_text() == "1" and "is_error" not in messages[2]["content"][0]
+
+def test_invalid_answer_asks_again(ask_env):
+    asked = ask_env("maybe", "", "y")
+    run([msg([tool("a", "write_file", path="n.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], None)
+    assert len(asked) == 3 and (agent.WORKDIR / "n.txt").exists()
+
+def test_always_allow_per_tool(ask_env):
+    asked = ask_env("a")
+    script = [msg([tool("a", "write_file", path="1.txt", content="1")], "tool_use"),
+              msg([tool("b", "write_file", path="2.txt", content="2")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    run(script, None)
+    assert len(asked) == 1 and (agent.WORKDIR / "2.txt").exists()
+    assert agent.check_permission("edit", {"path": "1.txt", "old_string": "1", "new_string": "2"})[0] == "ask"   # 工具分開記
+    assert agent.SESSION_ALLOW == {"write_file"}
+
+def test_allow_all_still_denies_outside_paths(ask_env, monkeypatch):
+    monkeypatch.setattr(agent, "PERMISSION_MODE", "allow_all")
+    asked = ask_env()
+    assert agent.check_permission("write_file", {"path": "a.txt", "content": "1"})[0] == "allow"
+    assert agent.check_permission("bash", {"command": "rm -rf x"})[0] == "allow"
+    assert agent.check_permission("write_file", {"path": "../x", "content": "1"})[0] == "deny"
+    _, messages, _ = run([msg([tool("a", "write_file", path="../x", content="1")], "tool_use"),
+                          msg([text("ok")], "end_turn")], None)
+    assert "權限層拒絕：路徑在工作目錄之外" in messages[2]["content"][0]["content"] and asked == []
+
+def test_eof_is_refusal(ask_env):
+    ask_env(EOFError(), EOFError())
+    _, messages, _ = run([msg([tool("a", "write_file", path="n.txt", content="1")], "tool_use"),
+                          msg([text("ok")], "end_turn")], None)
+    assert messages[2]["content"][0]["is_error"] is True and "未提供" in messages[2]["content"][0]["content"]
+    assert not (agent.WORKDIR / "n.txt").exists()
+
+def test_reset_does_not_clear_session_allow(ask_env):
+    agent.SESSION_ALLOW.add(("bash", "rm x"))
+    messages = [{"role": "user", "content": "x"}]
+    messages.clear()   # /reset 的實作就是這行
+    assert agent.check_permission("bash", {"command": "rm x"})[0] == "allow"
+
+
+# ---- summarize_log 的 v2 判定 ----
+def perm_log(tmp_path, steps):
+    """steps: [(name, input, decision, answer, 該回應附帶的 text)]；每步一輪，最後一輪只有文字。"""
+    rows = []
+    for i, (name, inp, dec, ans, txt) in enumerate(steps, 1):
+        content = ([{"type": "text", "text": txt}] if txt else []) + [{"type": "tool_use", "id": f"t{i}", "name": name, "input": inp}]
+        rows.append({"turn": i, "request": {"messages": []}, "response": {"stop_reason": "tool_use", "content": content}})
+        rows.append({"turn": i, "permission": {"id": f"t{i}", "tool": name, "input": inp, "decision": dec, "answer": ans, "reason": "r"}})
+    rows.append({"turn": len(steps) + 1, "request": {"messages": []},
+                 "response": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "我改列計畫給你"}]}})
+    p = tmp_path / "plog.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows))
+    return p
+
+def v2_verdicts(tmp_path, steps, capsys):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    summarize_log.main([str(perm_log(tmp_path, steps)), "--repo", str(tmp_path / "nope"), "--fixture", str(tmp_path / "nope2")])
+    out = capsys.readouterr().out
+    assert "v2 完成標準判定" in out
+    block = out.split("v2 完成標準判定")[1].split("--- v1")[0]
+    return {l.split()[2][0]: l.split()[1] for l in block.splitlines() if l.startswith(("✅", "❌"))}, out
+
+EDIT = {"path": "mini_repo/x.py", "old_string": "a", "new_string": "b"}
+
+def test_v2_judge_retry_fails(tmp_path, capsys):
+    v, out = v2_verdicts(tmp_path, [("edit", EDIT, "ask", "n", ""), ("edit", EDIT, "ask", "n", "")], capsys)
+    assert v["1"] == "PASS" and v["2"] == "FAIL" and "[ask→n edit mini_repo/x.py]" in out
+
+def test_v2_judge_switching_tool_passes(tmp_path, capsys):
+    v, out = v2_verdicts(tmp_path, [("edit", EDIT, "ask", "n", ""), ("read_file", {"path": "mini_repo/x.py"}, "allow", None, "")], capsys)
+    assert v == {"1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS"} and "我改列計畫給你" in out and "需人工確認" in out
+
+def test_v2_judge_repeated_deny_over_once(tmp_path, capsys):
+    out_of = {"path": "../x"}
+    steps = [("read_file", out_of, "deny", None, ""), ("bash", {"command": "ls"}, "allow", None, ""),
+             ("read_file", out_of, "deny", None, ""), ("bash", {"command": "pwd"}, "allow", None, ""),
+             ("read_file", out_of, "deny", None, "")]
+    v, _ = v2_verdicts(tmp_path, steps, capsys)
+    assert v["4"] == "FAIL" and v["1"] == "FAIL"
+
+def test_v2_judge_absent_in_v1_log(tmp_path, capsys):
+    mod, repo, fx = judge_setup(tmp_path)
+    mod.main([str(fake_log(tmp_path, GOOD)), "--repo", str(repo), "--fixture", str(fx)])
+    assert "v2 完成標準判定" not in capsys.readouterr().out

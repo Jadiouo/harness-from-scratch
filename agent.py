@@ -1,10 +1,11 @@
-"""v1 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）。不用框架、不用 SDK tool runner。"""
+"""v2 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層。不用框架、不用 SDK tool runner。"""
 import fnmatch, json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 
 import anthropic   # import 本身不需要 key；client 在 main 才建立
 
+# 刻意不在這裡寫「工具被拒絕時要換方法」：v2 要觀察模型光靠 tool_result 的「被拒絕」回饋能不能自己調整。
 # 放在最上面，方便實驗：拿掉一段，看行為怎麼變。
 SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
 你有六個工具：read_file、write_file、edit、grep、glob、bash。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
@@ -18,11 +19,12 @@ MODEL = os.environ.get("MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("EFFORT", "medium")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "25"))   # 防模型卡在同一個錯誤無限重試
 USE_FALLBACKS = os.environ.get("USE_FALLBACKS", "1") == "1"
-# v2 權限層之前，bash 只准在這個丟棄式資料夾跑（注意：絕對路徑仍能跑出去，這裡只是預設 cwd）
+# bash 的 cwd 是這個丟棄式資料夾（bash 本身仍能用絕對路徑跑出去，見權限層的說明）；檔案類工具的路徑由權限層限制在這裡面
 WORKDIR = Path(os.environ.get("WORKDIR", "./sandbox")).resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = Path("logs")
 MAX_TOOL_OUTPUT_CHARS = 10000
+PERMISSION_MODE = os.environ.get("PERMISSION_MODE", "ask").strip().lower()   # ask（預設）或 allow_all（等同 --dangerously-skip-permissions）
 MAX_RESULTS = 200   # grep/glob 的筆數上限，避免一次搜尋灌爆 context
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules"}   # 這些目錄的內容對模型只是雜訊
 
@@ -97,7 +99,7 @@ def truncate(text, limit=None):
 
 # ==== 【harness 角色：工具執行器】模型說「我要呼叫 X」，真正動手的是這裡 ====
 def _path(p):
-    return WORKDIR / p   # 絕對路徑會直接覆蓋 WORKDIR（Path 的行為）；v2 權限層才會擋
+    return WORKDIR / p   # 絕對路徑會直接覆蓋 WORKDIR（Path 的行為）；逃出 WORKDIR 由 check_permission 在執行前擋下
 
 def _rel(p):
     return p.relative_to(WORKDIR).as_posix()
@@ -111,10 +113,11 @@ def _files(base):
     if base.is_file():
         yield base
         return
-    for root, dirs, names in os.walk(base):
+    for root, dirs, names in os.walk(base):   # followlinks 預設 False：不會走進 symlink 目錄
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         for n in sorted(names):
-            yield Path(root) / n
+            if not (Path(root) / n).is_symlink():   # symlink 檔可能指到 WORKDIR 外，直接略過
+                yield Path(root) / n
 
 def _read_text(p):
     # newline="" 保留原本的 CRLF；用 read_text() 會把 \r\n 悄悄換成 \n，edit 寫回就改掉整個檔的換行
@@ -202,7 +205,7 @@ def grep(pattern, path=".", glob=None):
 
 def glob(pattern):
     found = sorted(_rel(f) for f in WORKDIR.glob(pattern)
-                   if f.is_file() and not SKIP_DIRS & set(f.relative_to(WORKDIR).parts))
+                   if f.is_file() and _inside(f) and not SKIP_DIRS & set(f.relative_to(WORKDIR).parts))
     if not found:
         return "沒有符合的檔案"
     out = "\n".join(found[:MAX_RESULTS])
@@ -228,6 +231,109 @@ def execute_tool(name, args):
         return {"content": f"Error: command timed out after {args.get('timeout', 30)}s", "is_error": True}
     except Exception as e:  # 參數錯（TypeError）、檔案不存在等都走這裡
         return {"content": truncate(f"Error: {type(e).__name__}: {e}"), "is_error": True}
+
+# ==== 【harness 角色：權限層】工具執行「之前」的守門員：allow 直接做、ask 問使用者、deny 直接拒絕 ====
+# 注意：bash 沒有被真正隔離，這裡只是字串判斷，不是安全邊界（例如使用者核准過的腳本可以做任何事）；
+# 真正的隔離要靠 OS 層 sandbox（Claude Code 有，我們沒做）。
+# 設計原則：不列舉危險指令（列不完），只放行「一眼看得出安全」的，其餘一律 ask。
+# 能跑腳本就能做任何事，字串規則擋不住，所以 python／pytest／find／env 這類「執行程式」的指令一律 ask。
+SAFE_COMMANDS = {"pwd", "ls", "cat", "head", "tail", "wc", "echo", "grep", "diff", "cd", "true", "which"}
+SAFE_SEGMENT = re.compile(r"[A-Za-z0-9 _./=:,+-]*")   # 一段指令只准有這些字元：引號、$、*、~、重導向、換行、非 ASCII 全部不在內
+SESSION_ALLOW = set()   # 使用者回 a 的記錄：檔案工具記工具名，bash 記 ("bash", 完全相同的指令)。模組層級、/reset 不清
+PROMPT = input          # 抽成變數，測試才能替換掉真正的鍵盤輸入
+
+def _inside(p):
+    return (WORKDIR / p).resolve().is_relative_to(WORKDIR.resolve())   # 含絕對路徑與 ..；resolve 也會跟著 symlink
+
+def _bash_rule(cmd):
+    # 只用 && || ; | 切段；切完每段必須只含安全字元（單一 & 因此也會 ask）。引號內的分隔符會被誤切，結果只是 ask
+    for seg in re.split(r"&&|\|\||;|\|", cmd):
+        if not SAFE_SEGMENT.fullmatch(seg):
+            return "ask", "含引號、變數、萬用字元、重導向、換行或非 ASCII 字元，無法一眼判斷安全"
+        w = seg.split()
+        if not w or w[0] not in SAFE_COMMANDS:
+            return "ask", f"不在白名單內的指令：{w[0] if w else '(空)'}"
+        for t in w[1:]:
+            # 把 --opt=/x、a:b 也拆開看；絕對路徑或 .. 片段都可能跑出 WORKDIR
+            if any(x.startswith("/") or ".." in x.split("/") for x in re.split(r"[=:,]", t)):
+                return "ask", f"路徑可能在工作目錄之外：{t}"
+        if w[0] == "cd" and len(w) != 2:
+            return "ask", "cd 只允許一個相對路徑參數"
+    return "allow", "白名單內的指令"
+
+def _session_key(name, args):
+    return ("bash", str(args.get("command", ""))) if name == "bash" else name   # bash 只記完全相同的指令
+
+def check_permission(name, args):
+    """回傳 (decision, reason)，decision 是 "allow" / "ask" / "deny"。"""
+    # 1. 路徑限制永遠先查，allow_all 也繞不過
+    if name == "glob":
+        pat = str(args.get("pattern", ""))
+        if os.path.isabs(pat) or ".." in Path(pat).parts:
+            return "deny", f"路徑在工作目錄之外：{pat}"
+    elif name in ("read_file", "write_file", "edit", "grep"):
+        p = str(args.get("path", "."))
+        if not _inside(p):
+            return "deny", f"路徑在工作目錄之外：{p}"
+    # 2. 規則
+    if name in ("read_file", "grep", "glob"):
+        return "allow", "唯讀工具"
+    if PERMISSION_MODE == "allow_all":
+        return "allow", "PERMISSION_MODE=allow_all"
+    decision, reason = ("ask", "會修改檔案") if name in ("write_file", "edit") else \
+                       _bash_rule(str(args.get("command", ""))) if name == "bash" else ("allow", "未知工具，交給執行器回報錯誤")
+    if decision == "ask" and _session_key(name, args) in SESSION_ALLOW:
+        return "allow", "本 session 已選過「允許」"
+    return decision, reason
+
+def ask_user(name, args, reason):
+    """問使用者，回傳 (答案 y/n/a, 拒絕理由)。"""
+    print(f"\n🔐 {name} 需要你的許可（{reason}）")
+    if name == "bash":
+        print(f"  command: {args.get('command')}")
+    elif name == "edit":
+        print(f"  path: {args.get('path')}\n  old: {str(args.get('old_string'))[:200]}\n  new: {str(args.get('new_string'))[:200]}")
+    elif name == "write_file":
+        print(f"  path: {args.get('path')}\n  內容前 10 行：\n" + "\n".join(str(args.get("content", "")).splitlines()[:10]))
+    ans = None
+    a_text = "[a]本次 session 不再詢問這條完全相同的指令" if name == "bash" else "[a]本次 session 都允許 這個工具（仍限工作目錄內）"
+    while ans not in ("y", "n", "a"):
+        try:
+            ans = PROMPT(f"允許嗎？[y]是 / [n]否 / {a_text} > ").strip().lower()
+        except EOFError:
+            ans = "n"   # 沒有人可以問，保守當作拒絕
+    note = ""
+    if ans == "n":
+        try:
+            note = PROMPT("拒絕理由（可留空）> ").strip()
+        except EOFError:
+            pass
+    if ans == "a":
+        SESSION_ALLOW.add(_session_key(name, args))
+    return ans, note
+
+def authorize(block):
+    """回傳 (被拒絕時要送回的 tool_result 或 None, 給 log 的 permission 記錄)。"""
+    name, args = block.name, block.input
+    try:
+        decision, reason = check_permission(name, args)
+    except Exception as e:   # 例如路徑含 NUL 會讓 resolve 丟 ValueError：判斷不了就拒絕，不要讓 REPL 崩潰
+        decision, reason = "deny", f"參數無法判斷（{e}）"
+    answer, result = None, None
+    if decision == "deny":
+        print(f"⛔ 權限層拒絕：{reason}")
+        result = {"content": f"權限層拒絕：{reason}", "is_error": True}
+    elif decision == "ask":
+        answer, note = ask_user(name, args, reason)
+        if answer == "n":
+            print("🚫 已拒絕")
+            reason += f"；使用者理由：{note}" if note else ""
+            # 拒絕也要回成 tool_result：tool_use 一定要有配對的結果，而且模型要看到回饋才能改走別的路
+            result = {"content": f"使用者拒絕了這個操作（{name}）。理由：{note or '未提供'}。這個操作沒有被執行。",
+                      "is_error": True}
+        else:
+            print("✅ 已允許")
+    return result, {"id": block.id, "tool": name, "input": args, "decision": decision, "answer": answer, "reason": reason}
 
 # ==== 【harness 角色：紀錄】每輪 request/response 存成 jsonl，事後回放是最好的學習材料 ====
 def to_jsonable(o):
@@ -314,6 +420,12 @@ def _loop(client, messages, log):
                     continue
                 summary = block.input.get("command") or block.input.get("pattern") or block.input.get("path") or ""
                 print(f"→ {block.name}: {summary}")
+                refusal, perm = authorize(block)
+                with open(log, "a") as f:
+                    f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
+                if refusal:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, **refusal})
+                    continue
                 result = execute_tool(block.name, block.input)
                 print(f"  {result['content'][:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, **result})
