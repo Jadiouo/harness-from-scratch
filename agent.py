@@ -1,4 +1,4 @@
-"""v4 迷你 coding agent：手寫 agent loop + 6 個工具（read_file/write_file/edit/grep/glob/bash）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）。不用框架、不用 SDK tool runner。"""
+"""v4 迷你 coding agent：手寫 agent loop + 7 個工具（read_file/write_file/edit/grep/glob/bash/todo_write）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）。不用框架、不用 SDK tool runner。"""
 import fnmatch, json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
@@ -9,8 +9,9 @@ import anthropic   # import 本身不需要 key；client 在 main 才建立
 # v3 同理：刻意不提示「context 可能被壓縮」，要觀察光靠摘要本身夠不夠讓它接續。
 # 放在最上面，方便實驗：拿掉一段，看行為怎麼變。
 SYSTEM_PROMPT = """你是一個在 WORKDIR 資料夾裡工作的 coding agent。
-你有六個工具：read_file、write_file、edit、grep、glob、bash。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
+你有七個工具：read_file、write_file、edit、grep、glob、bash、todo_write。所有相對路徑與 bash 的工作目錄都是 WORKDIR。
 先想清楚要做什麼，再動手。工作順序：不熟的程式碼先用 glob/grep 找位置，再 read_file 讀相關段落，再用 edit 做最小修改，最後用 bash 驗證。
+三個步驟以上的任務，動手前先用 todo_write 列出步驟清單，每完成一項就更新；context 被壓縮後，照清單接著做。
 改完或寫完程式後，一定要實際執行（用 bash）驗證結果，不要只憑推測說「應該可以」。
 工具回傳錯誤時，讀懂錯誤訊息並修正，不要重複同一個失敗的動作。
 完成後用簡短的話回報你做了什麼、驗證結果如何。
@@ -92,6 +93,20 @@ TOOLS = [
                       "properties": {"command": {"type": "string", "description": "要執行的 shell 指令"},
                                      "timeout": {"type": "integer", "description": "逾時秒數，預設 30"}},
                       "required": ["command"]}},
+    # 引導模型用不用它，全靠這段描述（system prompt 刻意不提 TODO，v4-TODO 實驗要觀察光靠工具描述會不會自發使用）
+    {"name": "todo_write",
+     "description": "維護任務清單，給需要 3 步以上的任務用。開工前先列出所有步驟，之後每完成一項就更新一次；"
+                    "同一時間只能有一項是 in_progress（正在做），其餘是 pending 或 completed。"
+                    "每次都要傳「整份」清單，會整個取代舊的（空陣列 = 清空）。"
+                    "一兩步就能做完的小事不要用。最多 50 項、每項 content 最多 200 字、content 不可換行、不可有 content/status 以外的欄位；"
+                    "不合法會回傳錯誤，不會被默默修正（只會去掉 content 前後空白）。",
+     "input_schema": {"type": "object",
+                      "properties": {"todos": {"type": "array", "description": "完整清單，依執行順序排列",
+                                               "items": {"type": "object",
+                                                         "properties": {"content": {"type": "string", "description": "這一步要做什麼"},
+                                                                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+                                                         "required": ["content", "status"]}}},
+                      "required": ["todos"]}},
 ]
 
 # ==== 【harness 角色：輸出截斷】工具輸出會進 context，太長會吃光窗口，所以保留頭尾 ====
@@ -222,8 +237,47 @@ def bash(command, timeout=30):
     r = subprocess.run(command, shell=True, cwd=WORKDIR, env=env, capture_output=True, text=True, timeout=timeout)
     return f"exit code: {r.returncode}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
 
+# TODO 清單由 harness 持有（模組層），不是由模型的記憶或對話歷史持有：壓縮會把歷史換掉，/reset 也要能一次清乾淨。
+# 整份取代而不是 add/update/delete：模型不用追蹤 id，也不會有增刪改彼此不一致的狀態（Claude Code 的 TodoWrite 同形狀；僅比較）。
+TODOS = []   # [{"content": str, "status": "pending" | "in_progress" | "completed"}]
+TODO_MARK = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+# 上限的理由：清單每次壓縮都整份重放進 context，不設限會越寫越肥
+MAX_TODOS, MAX_TODO_CHARS = 50, 200
+
+def render_todos():
+    return "\n".join(f"{TODO_MARK[t['status']]} {t['content']}" for t in TODOS)
+
+def todo_write(todos):
+    # 格式不對就報錯，不默默修正：模型要看到錯誤才知道自己的清單沒生效。驗證全過才動 TODOS，失敗時舊清單原封不動
+    if not isinstance(todos, list):
+        raise ValueError("todos 必須是陣列")
+    if len(todos) > MAX_TODOS:
+        raise ValueError(f"最多 {MAX_TODOS} 項（收到 {len(todos)} 項），請合併或只留重點步驟")
+    new = []
+    for i, t in enumerate(todos, 1):
+        if not isinstance(t, dict):
+            raise ValueError(f"第 {i} 項必須是 {{content, status}} 物件")
+        if not isinstance(t.get("content"), str) or not t["content"].strip():
+            raise ValueError(f"第 {i} 項的 content 必須是非空白字串")
+        if set(t) - {"content", "status"}:
+            raise ValueError(f"第 {i} 項有多餘欄位 {sorted(set(t) - {'content', 'status'})}，只能有 content 和 status")
+        c = t["content"].strip()
+        if "\n" in c or "\r" in c:   # 換行會破壞壓縮後 【目前 TODO】 區塊「一行一項」的格式
+            raise ValueError(f"第 {i} 項的 content 不可換行")
+        if len(c) > MAX_TODO_CHARS:
+            raise ValueError(f"第 {i} 項的 content 超過 {MAX_TODO_CHARS} 字（{len(c)} 字）")
+        if t.get("status") not in TODO_MARK:
+            raise ValueError(f"第 {i} 項的 status={t.get('status')!r} 不合法，只能是 pending / in_progress / completed")
+        new.append({"content": c, "status": t["status"]})
+    if sum(t["status"] == "in_progress" for t in new) > 1:
+        raise ValueError("同時只能有一項 in_progress，請先把其他的改成 pending 或 completed")
+    TODOS[:] = new
+    shown = render_todos() or "(空)"
+    print(shown)
+    return f"{shown}\n清單已更新"
+
 TOOL_FUNCS = {"read_file": read_file, "write_file": write_file, "edit": edit,
-              "grep": grep, "glob": glob, "bash": bash}
+              "grep": grep, "glob": glob, "bash": bash, "todo_write": todo_write}
 
 def execute_tool(name, args):
     # 錯誤一律回傳成 tool_result（is_error=True），不丟例外：
@@ -283,6 +337,8 @@ def check_permission(name, args):
     # 2. 規則
     if name in ("read_file", "grep", "glob"):
         return "allow", "唯讀工具"
+    if name == "todo_write":   # 只改 harness 記憶體裡的清單、不碰檔案，沒有東西需要守；放在 allow_all 判斷之前，ask 模式也不會問
+        return "allow", "只更新 harness 內的 TODO 清單，不碰檔案"
     if PERMISSION_MODE == "allow_all":
         return "allow", "PERMISSION_MODE=allow_all"
     decision, reason = ("ask", "會修改檔案") if name in ("write_file", "edit") else \
@@ -429,6 +485,7 @@ COMPACT_COOLDOWN = 0   # 還要略過幾輪自動壓縮；/compact 手動不看�
 HEADER_PREFIX = "【context 已壓縮】"
 USER_PREFIX = "【使用者原文】\n"
 SUMMARY_PREFIX = "【先前工作摘要】\n"
+TODO_PREFIX = "【目前 TODO】\n"   # 每次壓縮都由 TODOS 重新產生；舊的不會被保留，所以連續壓縮只會有最新一份
 
 SUMMARY_REQUEST = """【系統指示】請停止工作，不要呼叫任何工具，只輸出一份摘要，讓一個看不到上面歷史的 agent 能接著完成任務。請依序整理：
 1. 原始任務與使用者的所有要求
@@ -456,7 +513,7 @@ def user_texts(messages):
             continue
         for b in m["content"]:
             t = _field(b, "text")
-            if _field(b, "type") != "text" or t.startswith((HEADER_PREFIX, SUMMARY_PREFIX)):
+            if _field(b, "type") != "text" or t.startswith((HEADER_PREFIX, SUMMARY_PREFIX, TODO_PREFIX)):
                 continue
             out.append(t.removeprefix(USER_PREFIX))
     return out
@@ -509,12 +566,15 @@ def compact(client, messages, log, turn=0):
     blocks = [HEADER_PREFIX + "以下是使用者的原始要求（逐字原文）與先前工作的摘要。"]
     blocks += [USER_PREFIX + t for t in texts]
     blocks.append(f"{SUMMARY_PREFIX}{summary}\n\n請接著完成任務。")
+    # 摘要是模型寫的，可能漏掉進度（v3 觀察到壓縮後會重讀已改完的檔案）；清單是 harness 持有的事實，直接附上，不靠模型記
+    if TODOS:
+        blocks.append(TODO_PREFIX + render_todos())
     messages[:] = [{"role": "user", "content": [{"type": "text", "text": t} for t in blocks]}]
     # 摘要請求併進同一行 log（不另寫 request/response）；summary_usage 留著，統計 token 峰值時才不會漏掉它
     usage = getattr(response, "usage", None)
     with open(log, "a") as f:
         line = {"turn": turn, "compaction": {"before_tokens": before, "messages_before": n_before, "summary": summary,
-                "compact_at": COMPACT_AT_TOKENS, "system": kwargs["system"], "user_texts": texts, "summary_usage": usage.model_dump(mode="json") if usage else None}}
+                "compact_at": COMPACT_AT_TOKENS, "system": kwargs["system"], "user_texts": texts, "todos": [dict(t) for t in TODOS], "summary_usage": usage.model_dump(mode="json") if usage else None}}
         f.write(json.dumps(line, ensure_ascii=False, default=to_jsonable) + "\n")
     print(f"🗜 context 壓縮：{before} tokens → 摘要 {len(summary)} 字")
     return True
@@ -584,7 +644,7 @@ def _loop(client, messages, log):
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
                 result = refusal or execute_tool(block.name, block.input)
-                if not refusal:
+                if not refusal and block.name != "todo_write":   # todo_write 自己會印完整清單
                     print(f"  {result['content'][:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, **result})
                 # 「記錄一切」：壓縮會換掉歷史，之後只有這行能查到哪些操作成功過（request 裡的 tool_result 已被摘要取代）
@@ -665,6 +725,7 @@ def main():
             break
         if text == "/reset":
             messages.clear()
+            TODOS.clear()   # 清單屬於這段對話，歷史清掉清單也要清
             LAST_USAGE = None
             COMPACT_COOLDOWN = 0
             continue
@@ -677,6 +738,9 @@ def main():
         if text == "/memory":
             print(SESSION_MEMORY or "本 session 沒有載入 CLAUDE.md")
             print("（修改 CLAUDE.md 要下次啟動才生效）")
+            continue
+        if text == "/todo":
+            print(render_todos() or "目前沒有 TODO")
             continue
         if text == "/tokens":
             u = LAST_USAGE

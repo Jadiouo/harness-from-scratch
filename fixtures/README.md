@@ -39,3 +39,16 @@ rm sandbox/CLAUDE.md   # 做完移除，避免影響其他測驗
 ```
 預期：啟動時印 `📒 已載入 sandbox/CLAUDE.md`，第一次 bash 就用 `python3`；`summarize_log.py` 的「v4-記憶判定」三項都過。
 對照組：`logs/20261015-225449.jsonl`（v0 那次，沒有記憶）第一次用了 `python`、exit 127 後才改 `python3`。
+
+## v4-TODO 實驗（TODO 工具：模型會不會自發使用）
+沿用 v3 的 docstring_repo 和任務句，**任務句不提 TODO、system prompt 也沒有 TODO 說明**，只有 `todo_write` 的工具描述；觀察模型會不會自己先列清單、邊做邊更新。
+
+```bash
+rm -rf sandbox/docstring_repo && cp -r fixtures/docstring_repo sandbox/
+.venv/bin/python agent.py "docstring_repo 裡的函式都還沒有 docstring。請逐一讀過每個檔案，幫每個函式補上一行繁體中文 docstring。請用 edit 工具一個函式一個函式修改，不要寫腳本批次處理。完成後執行 python3 check_docstrings.py 確認。"
+.venv/bin/python scripts/summarize_log.py
+```
+詢問時的回答方式同 v3（edit 回 `a`、`python3 check_docstrings.py` 回 `a`）。`todo_write` 不會被詢問。
+
+看 `summarize_log.py` 的「v4-TODO 判定」：先規劃再動手、更新 >= 3 次、最後全 completed、每次壓縮都帶 todos；另有壓縮後下一輪的工具呼叫與失憶偵測（對照 v3 同任務的 `reread` 次數）。
+預期（尚未實跑）：若模型沒用 TODO 工具，會印「⚠ 長任務但沒用 TODO 工具」——這本身就是實驗結果，代表只靠工具描述不夠，下一步才考慮在 system prompt 加說明。

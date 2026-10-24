@@ -14,6 +14,8 @@ def latest_log():
 
 def brief(inp):
     # 主要參數：command / pattern / path 擇一，前 60 字元
+    if isinstance(inp.get("todos"), list):   # todo_write：顯示項數就好
+        return f"{len(inp['todos'])} 項"
     v = inp.get("command") or inp.get("pattern") or inp.get("path") or ""
     return str(v).replace("\n", " ")[:60]
 
@@ -200,6 +202,51 @@ def judge_v4(path):
         res.append((not BARE_PYTHON.search(first), "2. 第一次含 python 的 bash 指令用 python3", f"指令：{first[:100]}"))
     return res
 
+# ==== v4-TODO：只在 log 有 todo_write 時判定。前三項看行為，第四項看 harness 有沒有把清單帶進壓縮 ====
+def judge_todo(path):
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    # 只採計成功的 todo_write：失敗（格式錯）或被同批拒絕略過的呼叫沒有改到 TODOS，算進去會誤判模型有在維護清單
+    _, errors = load_calls(path)
+    for d in rows:
+        if "tool_result" in d:
+            errors[d["tool_result"]["id"]] = bool(d["tool_result"].get("is_error"))
+    ok_call = lambda b: errors.get(b["id"]) is False   # 沒有 tool_result 行的舊 log 查不到成功，保守算失敗
+    seq, lists, comps = [], [], []   # seq: 依序的工具呼叫；lists: 每次成功 todo_write 的清單；comps: (壓縮 log 行, 當時最新成功清單, 之後第一輪的呼叫)
+    for d in rows:
+        if "compaction" in d:
+            comps.append([d["compaction"], list(lists[-1]) if lists else [], None])
+        content = d.get("response", {}).get("content", [])
+        for b in content:
+            if b.get("type") == "tool_use":
+                seq.append(b)
+                if b["name"] == "todo_write" and ok_call(b):
+                    todos = b.get("input", {}).get("todos")
+                    lists.append([t for t in todos if isinstance(t, dict)] if isinstance(todos, list) else [])
+        if "response" in d and comps and comps[-1][2] is None:   # 壓縮後的第一個回應
+            comps[-1][2] = [f"{b['name']}({brief(b.get('input', {}))})" for b in content if b.get("type") == "tool_use"]
+    if not any(b["name"] == "todo_write" for b in seq):
+        return None
+    names = [b["name"] for b in seq]
+    first_todo = next((i for i, b in enumerate(seq) if b["name"] == "todo_write" and ok_call(b)), None)
+    first_edit = next((i for i, n in enumerate(names) if n in ("edit", "write_file")), None)
+    # 已知漏洞：只看 edit/write_file，bash 寫檔（sed -i、> 重導向）不算
+    res = [(first_todo is not None and (first_edit is None or first_todo < first_edit),
+            "1. 第一次成功的 todo_write 在第一次 edit/write_file 之前（先規劃再動手）",
+            "沒有成功的 todo_write" if first_todo is None else
+            "" if first_edit is None else f"todo_write 第 {first_todo + 1} 個呼叫，edit/write_file 第 {first_edit + 1} 個")]
+    res.append((len(lists) >= 3, f"2. 成功的 todo_write >= 3 次（實際 {len(lists)}）", ""))
+    # 空陣列 = 清除，是合法收尾：最後一次是空的就改看最後一份非空清單
+    last = next((l for l in reversed(lists) if l), [])
+    undone = [t.get("content") for t in last if t.get("status") != "completed"]
+    res.append((bool(last) and not undone, "3. 最後一份非空清單全部 completed", f"未完成：{undone}" if undone else ""))
+    need = [(c, exp) for c, exp, _ in comps if exp]   # 壓縮當下已有清單的才要求帶 todos，且要等於當時最新成功清單
+    if need:
+        bad = [c.get("turn") for c, exp in need if c.get("todos") != exp]
+        res.append((not bad, f"4. 每次 compaction 都帶與當時最新清單相同的 todos（需要的 {len(need)} 次）", f"沒帶或不相符的 compaction：{bad}" if bad else ""))
+    else:
+        res.append((True, "4. 壓縮帶清單：不適用（沒有壓縮當下已有清單的 compaction）", ""))
+    return res, last, [(c, nxt) for c, _, nxt in comps], len(lists)
+
 def forgot_after_compaction(path):
     """6（觀察，不判 FAIL；都是近似判斷）。以 tool_result 行判斷 edit 是否成功（壓縮後 request 裡的結果已被換掉）。
     reread：壓縮前已成功 edit 過 F、壓縮後又 read_file F，而且之後沒再成功 edit F（只是重讀確認，代表不確定 F 做完沒）。
@@ -317,6 +364,23 @@ def main(argv):
         mem = next(d["request"]["system"] for l in path.read_text().splitlines() if "system" in (d := json.loads(l)).get("request", {}))
         print("3. 載入的記憶（前 200 字）：" + mem.split(MEMORY_MARK, 1)[1].split("\n", 1)[-1][:200].replace("\n", " "))
         print("結果:", "全部通過" if all(ok for ok, _, _ in res4) else "有未通過項目")
+    res_todo = judge_todo(path)
+    if res_todo:
+        res, last, comps, n_todo = res_todo
+        print("--- v4-TODO 判定 ---")
+        for ok, label, detail in res:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        print(f"todo_write 成功次數：{n_todo}；最後非空清單：" + ("(空)" if not last else ""))
+        print("\n".join(f"    [{({'pending': ' ', 'in_progress': '>', 'completed': 'x'}).get(t.get('status'), '?')}] {t.get('content')}" for t in last))
+        fg = forgot_after_compaction(path)
+        print(f"觀察（不判 PASS/FAIL）：5. 壓縮後下一輪的工具呼叫；失憶偵測 reread={len(fg['reread'])} dup={len(fg['dup'])} other={len(fg['other'])}")
+        for i, (c, nxt) in enumerate(comps, 1):
+            print(f"    壓縮 #{i}（todos {len(c.get('todos') or [])} 項）之後：{'; '.join(nxt) if nxt else '(無)'}")
+        print("結果:", "全部通過" if all(ok for ok, l, _ in res if "不適用" not in l) else "有未通過項目")   # 不適用的項目不計入
+    elif sum(counts.values()) > 10:
+        print("⚠ 長任務但沒用 TODO 工具")
     if "docstring_repo" in path.read_text():   # v3 判定不受下面 v1 防呆影響
         print("--- v3 完成標準判定 ---")
         v3repo, v3fx = (Path(p) if Path(p).is_absolute() else ROOT / p for p in (args.v3_repo, args.v3_fixture))

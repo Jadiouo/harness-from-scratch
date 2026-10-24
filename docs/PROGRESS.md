@@ -134,3 +134,27 @@
 - 有記憶（logs/v4-mem-with.jsonl）：第 1 輪就 `python3 hello.py`，2 輪完成；v4 判定全 PASS（system 2 個請求皆相同）。
 - 對照組無記憶（logs/v4-mem-control.jsonl）：第 2 輪 `python hello.py` 失敗，第 3 輪才 `python3`，4 輪完成。
 - 結論：CLAUDE.md 確實省掉一次「重新發現環境限制」的試錯。樣本各 1 次，屬示範而非統計。
+
+## v4-2 TODO 工具（todo_write）
+- 設計（定案）：每次交整份清單、整份取代；狀態存 harness（TODOS）；system prompt 只列工具名、不寫 TODO 用法（觀察只靠工具描述會不會自發使用）；權限直接 allow；壓縮時在摘要後附 `【目前 TODO】` 區塊（清單是 harness 持有的事實，不靠摘要記）；/todo、/reset 清空。
+- 指揮官自修：SYSTEM_PROMPT「六個工具」→ 列出七個（與實際一致）；todo_write 清單在終端重複印兩次 → 只印一次。
+
+### v4-2 審查第 1 輪（sonnet，乾淨上下文）
+- 驗證：pytest `195 passed`。
+- 必改（皆採納）：judge_todo 把失敗/被略過的 todo_write 也採計；壞輸入會讓 judge 崩；無壓縮時第 4 項空洞 PASS；工具描述說「不靜默修正」但實作丟多餘欄位、content 換行會破壞區塊格式、無長度上限。
+- 建議採納：最後清空清單不算 FAIL（看最後一份非空清單）；文件註明 bash 寫檔不算「動手」。
+- 不採納：使用者輸入剛好以 `【目前 TODO】` 開頭會被吃掉（機率極低）；REPL 沒 /reset 時 TODOS 延續到下一任務（刻意：清單屬於 session，下一任務會整份取代；已寫進文件）。
+- 修正後驗證：pytest `206 passed`；指揮官實測 todo_write 正常、換行與多餘欄位皆 is_error、權限 allow。無必改項，進真實測驗。
+
+### v4-2 真實測驗第 1 次（logs/v4-todo-run1-nohint.jsonl）— 模型沒用 TODO
+- 條件：只有工具描述引導，system prompt 只列工具名。
+- 結果：90 次工具呼叫（read_file 31、edit 56）、壓縮 4 次，todo_write **0 次**；v3 判定全 PASS（ALL OK），失憶偵測 0。
+- 解讀（推論）：任務本身有天然分段（按資料夾一批讀、一批改），模型不需要外部清單；只靠工具描述不足以讓它自發使用。
+- 觀察：壓縮後有 1 次原樣重讀（第 4→5 輪 geometry 6 檔），另外 3 次壓縮後直接 edit 沒重讀（摘要帶到足夠內容）。
+- 下一步：system prompt 加一句「三步以上先 todo_write 列清單、每完成一項更新、壓縮後照清單接著做」，同任務重跑當實驗組（對照組即本次）。pytest `206 passed`。
+
+### v4-2 真實測驗第 2 次（logs/v4-todo-run2-hint.jsonl，system prompt 加 TODO 提示）— 通過
+- v4-TODO 判定 4 項全 PASS：第 2 輪就列 5 項清單（按資料夾＋最後驗證）；成功更新 6 次；最後全 completed；4 次壓縮都帶最新清單。v3 判定全 PASS（91 次工具呼叫、ALL OK、峰值 11,045）。
+- 每次壓縮後第一個動作都是 todo_write 更新清單，接著直接做下一個資料夾。
+- read_file 31 → 25：本次壓縮後**沒有重讀**（run1 有 1 次 6 檔重讀）。注意（推論）：本次壓縮都落在 edit 批次之後、而非剛讀完檔時，重讀減少可能主要來自壓縮時機不同，不能全歸功於清單；各 1 次樣本。
+- 對照結論：只靠工具描述 → 0 次使用；system prompt 加一句 → 規劃、更新、壓縮後接續都出現。與 v1「改工具描述比改程式有效」對照：這次是工具描述不夠、要 system prompt。

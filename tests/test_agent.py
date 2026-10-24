@@ -42,6 +42,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "COMPACT_COOLDOWN", 0)
     monkeypatch.setattr(agent, "SESSION_SYSTEM", agent.SYSTEM_PROMPT)   # main 會改它；測完還原，避免測試間污染
     monkeypatch.setattr(agent, "SESSION_MEMORY", None)
+    monkeypatch.setattr(agent, "TODOS", [])
     monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)   # 預設值是給真實測驗用的 8000；單元測試用固定值
     return tmp_path
 
@@ -1306,3 +1307,180 @@ def test_compact_failed_logs_system(env, monkeypatch):
 def test_v4_block_absent_without_memory(tmp_path, capsys):
     mod, _, _ = judge_setup(tmp_path)
     assert "v4-記憶判定" not in v4_out(mod, fake_rows(tmp_path, [req_row(1, agent.SYSTEM_PROMPT, "ls")]), capsys)
+
+
+# ==== v4：TODO 工具 ====
+def td(content, status="pending"):
+    return {"content": content, "status": status}
+
+def test_todo_write_replaces_whole_list(env):
+    r = agent.execute_tool("todo_write", {"todos": [td("a", "in_progress"), td("b")]})
+    assert "is_error" not in r and "[>] a" in r["content"] and "[ ] b" in r["content"] and "清單已更新" in r["content"]
+    r = agent.execute_tool("todo_write", {"todos": [td("c", "completed")]})
+    assert agent.TODOS == [td("c", "completed")] and "[x] c" in r["content"] and "[ ] b" not in r["content"]
+
+@pytest.mark.parametrize("bad", [
+    "不是陣列", [1], [{"content": "a"}], [{"status": "pending"}],
+    [td("a", "done")], [td("   ")], [{"content": 3, "status": "pending"}],
+    [td("a", "in_progress"), td("b", "in_progress")],
+])
+def test_todo_write_rejects_bad_input_and_keeps_old_list(env, bad):
+    agent.execute_tool("todo_write", {"todos": [td("舊")]})
+    r = agent.execute_tool("todo_write", {"todos": bad})
+    assert r["is_error"] is True and agent.TODOS == [td("舊")]
+
+def test_todo_write_missing_arg_and_empty_list(env):
+    assert agent.execute_tool("todo_write", {})["is_error"] is True
+    agent.execute_tool("todo_write", {"todos": [td("a")]})
+    r = agent.execute_tool("todo_write", {"todos": []})
+    assert "is_error" not in r and agent.TODOS == []
+
+def test_todo_write_always_allowed_without_asking(ask_env):
+    asked = ask_env()
+    assert agent.check_permission("todo_write", {"todos": []}) == ("allow", "只更新 harness 內的 TODO 清單，不碰檔案")
+    script = [msg([tool("a", "todo_write", todos=[td("x", "in_progress")])], "tool_use"), msg([text("ok")], "end_turn")]
+    run(script, None)
+    assert asked == [] and agent.TODOS == [td("x", "in_progress")]
+
+def test_compaction_appends_todo_block_and_latest_only(env):
+    messages = []
+    agent.add_user_text(messages, "第一句")
+    agent.execute_tool("todo_write", {"todos": [td("舊項目", "in_progress")]})
+    assert agent.compact(FakeClient([msg([text("摘要1")], "end_turn")]), messages, agent.new_log_path())
+    ts = texts_of(messages)
+    assert ts[-1] == agent.TODO_PREFIX + "[>] 舊項目" and ts[-2].startswith(agent.SUMMARY_PREFIX)   # 在摘要之後
+    agent.execute_tool("todo_write", {"todos": [td("舊項目", "completed"), td("新項目")]})
+    agent.add_user_text(messages, "第二句")
+    log = agent.new_log_path()
+    assert agent.compact(FakeClient([msg([text("摘要2")], "end_turn")]), messages, log)
+    ts = texts_of(messages)
+    todo_blocks = [t for t in ts if t.startswith(agent.TODO_PREFIX)]
+    assert todo_blocks == [agent.TODO_PREFIX + "[x] 舊項目\n[ ] 新項目"]
+    assert agent.user_texts(messages) == ["第一句", "第二句"]   # TODO 區塊不被當成使用者原文
+    c = [r["compaction"] for r in log_rows(log) if "compaction" in r][-1]   # 同一秒內 new_log_path 會回同一個檔，取最後一行
+    assert c["todos"] == [td("舊項目", "completed"), td("新項目")] and c["user_texts"] == ["第一句", "第二句"]
+
+def test_compaction_without_todos_adds_no_block(env):
+    messages = []
+    agent.add_user_text(messages, "hi")
+    log = agent.new_log_path()
+    assert agent.compact(FakeClient([msg([text("S")], "end_turn")]), messages, log)
+    assert not any(t.startswith(agent.TODO_PREFIX) for t in texts_of(messages))
+    assert next(r["compaction"] for r in log_rows(log) if "compaction" in r)["todos"] == []
+
+def test_tools_identical_across_turns_and_compaction_with_todos(env):
+    script = [msg([tool("a", "todo_write", todos=[td("x", "in_progress")])], "tool_use", usage=(30000, 100)),
+              msg([text("S")], "end_turn"),
+              msg([tool("b", "bash", command="echo 1")], "tool_use", usage=(100, 10)),
+              msg([text("done")], "end_turn", usage=(100, 10))]
+    client, messages, _ = run(script, env)
+    assert len(client.calls) == 4 and all(c["tools"] == agent.TOOLS for c in client.calls)
+    assert any(t["name"] == "todo_write" for t in agent.TOOLS)
+    assert client.calls[2]["messages"][0]["content"][-1]["text"].startswith(agent.TODO_PREFIX)
+
+def test_repl_reset_clears_todos_and_todo_command(env, monkeypatch, capsys):
+    agent.TODOS[:] = [td("a", "completed"), td("b")]
+    repl(monkeypatch, FakeClient([]), ["/todo", "/reset", "/todo", "/exit"])
+    out = capsys.readouterr().out
+    assert "[x] a\n[ ] b" in out and "目前沒有 TODO" in out and agent.TODOS == []
+
+def todo_rows(steps):
+    """steps: ("todo", [td...]) 成功 / ("todo_err", ...) 失敗 / ("todo_skip", ...) 被略過 / ("edit",) / ("comp", todos 或 None)"""
+    rows, n = [], 0
+    for st in steps:
+        n += 1
+        if st[0] == "comp":
+            c = {"before_tokens": 1, "messages_before": 1, "summary": "s"}
+            if st[1] is not None:
+                c["todos"] = st[1]
+            rows.append({"turn": n, "compaction": c})
+            continue
+        is_todo = st[0].startswith("todo")
+        b = ({"type": "tool_use", "id": f"t{n}", "name": "todo_write", "input": {"todos": st[1]}} if is_todo else
+             {"type": "tool_use", "id": f"t{n}", "name": st[0], "input": {"path": "a.py", "command": "ls"}})
+        rows.append({"turn": n, "request": {"system": "S", "messages": []},
+                     "response": {"stop_reason": "tool_use", "content": [b]}})
+        rows.append({"turn": n, "tool_result": {"id": f"t{n}", "tool": b["name"], "is_error": st[0] in ("todo_err", "todo_skip"), "content": ""}})
+    return rows
+
+def todo_out(tmp_path, capsys, steps):
+    tmp_path.mkdir(exist_ok=True)
+    mod, _, _ = judge_setup(tmp_path)
+    return v4_out(mod, fake_rows(tmp_path, todo_rows(steps)), capsys)
+
+def test_todo_judge_pass(tmp_path, capsys):
+    A, B = [td("a", "in_progress"), td("b")], [td("a", "completed"), td("b", "completed")]
+    out = todo_out(tmp_path, capsys, [("todo", A), ("edit",), ("comp", A), ("bash",), ("todo", A), ("todo", B)])
+    sec = out.split("v4-TODO 判定")[1]
+    assert "❌" not in sec and sec.count("✅ PASS") == 4 and "todo_write 成功次數：3" in sec
+    assert "[x] a" in sec and "壓縮 #1" in sec and "bash(" in sec
+
+def test_todo_judge_edit_before_todo_fails_item1(tmp_path, capsys):
+    B = [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("edit",), ("todo", B), ("todo", B), ("todo", B)])
+    assert "❌ FAIL 1." in out and "✅ PASS 2." in out and "✅ PASS 3." in out
+
+def test_todo_judge_items_2_3_4(tmp_path, capsys):
+    A = [td("a", "in_progress")]
+    out = todo_out(tmp_path, capsys, [("todo", A), ("comp", None), ("comp", [])])   # 舊 log 沒 todos、或 todos 空
+    assert "❌ FAIL 2." in out and "❌ FAIL 3." in out and "❌ FAIL 4." in out
+
+def test_todo_judge_compaction_before_any_todo_is_not_required(tmp_path, capsys):
+    B = [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("comp", None), ("todo", B), ("todo", B), ("todo", B)])
+    assert "✅ PASS 4." in out
+
+def test_todo_warning_for_long_task_without_todo(tmp_path, capsys):
+    out = todo_out(tmp_path, capsys, [("bash",)] * 11)
+    assert "⚠ 長任務但沒用 TODO 工具" in out and "v4-TODO 判定" not in out
+    out = todo_out(tmp_path / "b", capsys, [("bash",)] * 10)
+    assert "長任務但沒用 TODO" not in out
+
+def test_todo_judge_counts_only_successful_calls(tmp_path, capsys):
+    B = [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("todo", B), ("todo_err", B), ("todo_skip", B)])
+    assert "❌ FAIL 2." in out and "成功次數：1" in out
+    out = todo_out(tmp_path / "b", capsys, [("todo_err", B), ("edit",), ("todo", B), ("todo", B), ("todo", B)])
+    assert "❌ FAIL 1." in out   # 失敗的 todo_write 不算「先規劃」
+    out = todo_out(tmp_path / "c", capsys, [("todo", [td("a", "in_progress")]), ("todo_err", [td("a", "completed")])])
+    assert "❌ FAIL 3." in out   # 失敗的那份「全部 completed」不算最後清單
+
+def test_todo_judge_bad_input_does_not_crash(tmp_path, capsys):
+    out = todo_out(tmp_path, capsys, [("todo", "abc"), ("todo", [1, None, td("a", "completed")]), ("todo", [td("a", "completed")])])
+    assert "v4-TODO 判定" in out and "✅ PASS 3." in out
+
+def test_todo_judge_empty_final_list_uses_last_nonempty(tmp_path, capsys):
+    B = [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("todo", [td("a", "in_progress")]), ("todo", B), ("todo", [])])
+    assert "✅ PASS 3." in out
+    out = todo_out(tmp_path / "b", capsys, [("todo", []), ("todo", []), ("todo", [])])
+    assert "❌ FAIL 3." in out   # 從沒有過非空清單
+
+def test_todo_judge_item4_not_applicable_without_list_at_compaction(tmp_path, capsys):
+    B = [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("comp", None), ("todo", B), ("todo", B), ("todo", B)])
+    sec = out.split("v4-TODO 判定")[1]
+    assert "4. 壓縮帶清單：不適用" in sec and "全部通過" in sec
+
+def test_todo_judge_item4_requires_latest_successful_list(tmp_path, capsys):
+    A, B = [td("a", "in_progress")], [td("a", "completed")]
+    out = todo_out(tmp_path, capsys, [("todo", A), ("todo", B), ("comp", A)])   # 帶了舊清單
+    assert "❌ FAIL 4." in out
+    out = todo_out(tmp_path / "b", capsys, [("todo", A), ("todo_err", B), ("comp", A)])   # 失敗的那份不算最新
+    assert "✅ PASS 4." in out
+
+@pytest.mark.parametrize("bad", [
+    [{"content": "a", "status": "pending", "id": 1}],
+    [td("第一行\n第二行")], [td("a\rb")],
+    [td(f"x{i}") for i in range(51)], [td("字" * 201)],
+])
+def test_todo_write_rejects_extra_fields_newlines_and_over_limits(env, bad):
+    agent.execute_tool("todo_write", {"todos": [td("舊")]})
+    r = agent.execute_tool("todo_write", {"todos": bad})
+    assert r["is_error"] is True and agent.TODOS == [td("舊")]
+
+def test_todo_write_strips_whitespace_and_accepts_limits(env):
+    r = agent.execute_tool("todo_write", {"todos": [td("  a \t")]})
+    assert "is_error" not in r and agent.TODOS == [td("a")]
+    r = agent.execute_tool("todo_write", {"todos": [td("字" * 200) for _ in range(50)]})
+    assert "is_error" not in r and len(agent.TODOS) == 50
