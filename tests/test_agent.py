@@ -652,7 +652,7 @@ def test_v2_judge_retry_fails(tmp_path, capsys):
 
 def test_v2_judge_switching_tool_passes(tmp_path, capsys):
     v, out = v2_verdicts(tmp_path, [("edit", EDIT, "ask", "n", ""), ("read_file", {"path": "mini_repo/x.py"}, "allow", None, "")], capsys)
-    assert v == {"1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS"} and "我改列計畫給你" in out and "需人工確認" in out
+    assert v == {"1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS"} and "我改列計畫給你" in out and "需人工確認" in out
 
 def test_v2_judge_repeated_deny_over_once(tmp_path, capsys):
     out_of = {"path": "../x"}
@@ -666,3 +666,73 @@ def test_v2_judge_absent_in_v1_log(tmp_path, capsys):
     mod, repo, fx = judge_setup(tmp_path)
     mod.main([str(fake_log(tmp_path, GOOD)), "--repo", str(repo), "--fixture", str(fx)])
     assert "v2 完成標準判定" not in capsys.readouterr().out
+
+# ---- v2：同批連帶略過（一則回應的多個 tool_use 是同一個計畫，拒絕一個，後面的都不做）----
+def perms_of(log):
+    return [json.loads(l)["permission"] for l in log.read_text().splitlines() if "permission" in l]
+
+def test_rejection_skips_rest_of_batch(ask_env):
+    put("a.py", "x = 1\n"); put("b.py", "y = 1\n")
+    asked = ask_env("n", "x")
+    script = [msg([tool("a", "edit", path="a.py", old_string="x = 1", new_string="x = 2"),
+                   tool("b", "edit", path="b.py", old_string="y = 1", new_string="y = 2"),
+                   tool("c", "bash", command="python3 b.py")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    _, messages, log = run(script, None)
+    assert len(asked) == 2   # 只有第一個被問（答案＋理由）
+    assert (agent.WORKDIR / "b.py").read_text() == "y = 1\n"
+    results = messages[2]["content"]
+    assert [r["tool_use_id"] for r in results] == ["a", "b", "c"] and len(messages) == 4
+    assert all(r["is_error"] for r in results)
+    assert all("同一批中前面的 edit" in r["content"] for r in results[1:])
+    check_pairing(messages)
+    perms = perms_of(log)
+    assert [p["decision"] for p in perms] == ["ask", "skipped", "skipped"]
+    assert all(p["answer"] is None and p["id"] in "bc" for p in perms[1:])
+
+def test_executed_before_rejection_keeps_real_result(ask_env):
+    put("a.py", "x = 1\n"); put("b.py", "y = 1\n")
+    ask_env("n", "")
+    script = [msg([tool("r", "read_file", path="a.py"),
+                   tool("a", "edit", path="a.py", old_string="x = 1", new_string="x = 2"),
+                   tool("b", "edit", path="b.py", old_string="y = 1", new_string="y = 2")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    _, messages, _ = run(script, None)
+    r = messages[2]["content"]
+    assert "is_error" not in r[0] and "x = 1" in r[0]["content"]
+    assert r[2]["is_error"] and "同一批中前面的 edit" in r[2]["content"]
+
+def test_deny_skips_rest_without_asking(ask_env):
+    put("a.py", "x = 1\n")
+    asked = ask_env()
+    script = [msg([tool("g", "glob", pattern="../*"),
+                   tool("a", "edit", path="a.py", old_string="x = 1", new_string="x = 2")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    _, messages, log = run(script, None)
+    assert asked == [] and (agent.WORKDIR / "a.py").read_text() == "x = 1\n"
+    assert "同一批中前面的 glob" in messages[2]["content"][1]["content"]
+    assert [p["decision"] for p in perms_of(log)] == ["deny", "skipped"]
+
+def test_no_rejection_runs_everything(ask_env):
+    put("a.py", "x = 1\n"); put("b.py", "y = 1\n")
+    asked = ask_env("y", "y")
+    script = [msg([tool("a", "edit", path="a.py", old_string="x = 1", new_string="x = 2"),
+                   tool("b", "edit", path="b.py", old_string="y = 1", new_string="y = 2")], "tool_use"),
+              msg([text("ok")], "end_turn")]
+    run(script, None)
+    assert len(asked) == 2
+    assert (agent.WORKDIR / "a.py").read_text() == "x = 2\n" and (agent.WORKDIR / "b.py").read_text() == "y = 2\n"
+
+def test_summarize_item5_real_log_fails_and_skipped_log_passes(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    real = Path(__file__).resolve().parent.parent / "logs" / "v2-run2-reject.jsonl"
+    item5 = lambda p: next(r for r in summarize_log.judge_v2(p) if r[1].startswith("5."))
+    assert item5(real)[0] is False
+    uses = [{"type": "tool_use", "id": i, "name": "edit", "input": {"path": f"{i}.py"}} for i in "abc"]
+    rows = [{"turn": 1, "response": {"content": uses}}]
+    rows += [{"turn": 1, "permission": {"id": i, "tool": "edit", "input": {}, "decision": d, "answer": a}}
+             for i, d, a in [("a", "ask", "n"), ("b", "skipped", None), ("c", "skipped", None)]]
+    fake = tmp_path / "skipped.jsonl"
+    fake.write_text("\n".join(json.dumps(r) for r in rows))
+    assert item5(fake)[0] is True

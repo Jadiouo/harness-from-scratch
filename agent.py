@@ -415,12 +415,23 @@ def _loop(client, messages, log):
         reason = response.stop_reason
         if reason == "tool_use":
             results = []   # 本則回應的「所有」tool_use 都要執行，結果放進「同一則」user 訊息
+            # 同一則回應的多個 tool_use 是同一個計畫：只核准一半會留下不一致的狀態（例如改了 check.py 沒改 reports.py）。
+            # 所以第一個被拒絕之後，同批後面的都不問、不執行。
+            # 限制：拒絕「之前」已執行的步驟不會回滾，它們的結果照舊如實保留。
+            rejected = None   # 本批第一個被拒絕的工具名
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                summary = block.input.get("command") or block.input.get("pattern") or block.input.get("path") or ""
-                print(f"→ {block.name}: {summary}")
-                refusal, perm = authorize(block)
+                if rejected:
+                    print(f"⏭ 略過 {block.name}（同批前一個操作被拒絕）")
+                    perm = {"id": block.id, "tool": block.name, "input": block.input, "decision": "skipped",
+                            "answer": None, "reason": f"同批前面的 {rejected} 被拒絕"}
+                    refusal = {"content": f"因為同一批中前面的 {rejected} 操作被拒絕，這個操作沒有執行。", "is_error": True}
+                else:
+                    summary = block.input.get("command") or block.input.get("pattern") or block.input.get("path") or ""
+                    print(f"→ {block.name}: {summary}")
+                    refusal, perm = authorize(block)
+                    rejected = block.name if refusal else None
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
                 if refusal:
