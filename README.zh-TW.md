@@ -1,6 +1,6 @@
-# coding-agent-from-scratch
+# harness-from-scratch
 
-一個手寫的、Claude Code 風格的 coding agent：直接用 Anthropic Messages API，不用 agent 框架，也不用 SDK 的 tool runner。分 v0–v4 五個階段做，目的是看清楚 harness 到底在做什麼；每個階段都有實驗和寫明的完成標準。
+從零手寫的 agent harness：也就是 Claude Code 這類 coding agent 裡，包在模型外面的那一層——agent loop、工具、權限、上下文管理、記憶、subagent 與 hooks。直接用 Anthropic Messages API，不用 agent 框架，也不用 SDK 的 tool runner。分 v0–v4 五個階段做，每個階段都有實驗和寫明的完成標準。
 
 [English](README.md) | 繁體中文
 
@@ -86,8 +86,8 @@ flowchart TD
 需要 Python 3.10 以上（開發環境為 3.11）以及 `claude-opus-5-5` 的使用權限。
 
 ```bash
-git clone https://github.com/Jadiouo/coding-agent-from-scratch.git
-cd coding-agent-from-scratch
+git clone https://github.com/Jadiouo/harness-from-scratch.git
+cd harness-from-scratch
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env && chmod 600 .env     # 然後把 key 填進 ANTHROPIC_API_KEY

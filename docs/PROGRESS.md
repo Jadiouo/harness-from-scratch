@@ -221,3 +221,7 @@
 - 舊歷史只留在本機分支 backup/pre-rewrite（未推送）。
 - 推送 main 到 https://github.com/Jadiouo/coding-agent-from-scratch（PRIVATE）。重新 clone 驗證：78 個檔案，無 logs/、sandbox/、.env、.agent；全歷史掃描 email／家目錄／session 網址／key 皆 0。pytest `270 passed`。
 - 待使用者：在 GitHub 上看過後自行轉 public。
+
+## 改名與收尾（使用者決定）
+- repo 改名 harness-from-scratch（使用者：目的是了解 harness 的流程，「coding agent」不貼切）；README 標題與定位句改成以 harness 為主。上面歷史紀錄中的舊名保留不改。
+- 不補跑各實驗 3–5 次（使用者：目的是理解 harness 流程，n=1 的示範已足夠；README 已標明 n=1）。專案至此完成。

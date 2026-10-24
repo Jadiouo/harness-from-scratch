@@ -1,6 +1,6 @@
-# coding-agent-from-scratch
+# harness-from-scratch
 
-A hand-built, Claude-Code-style coding agent on the raw Anthropic Messages API (no agent framework, no SDK tool runner), built in stages v0–v4 to understand what the harness actually does, with an experiment and a written completion criterion at every stage.
+An agent harness built from scratch: the loop, tools, permissions, context management, memory, subagents and hooks that sit around the model in a Claude-Code-style coding agent, written directly on the Anthropic Messages API (no agent framework, no SDK tool runner). Built in stages v0–v4, with an experiment and a written completion criterion at every stage.
 
 English | [繁體中文](README.zh-TW.md)
 
@@ -86,8 +86,8 @@ Completion thresholds in the judge script (for example "subagent result under 20
 Requires Python 3.10+ (developed on 3.11) and access to `claude-opus-5-5`.
 
 ```bash
-git clone https://github.com/Jadiouo/coding-agent-from-scratch.git
-cd coding-agent-from-scratch
+git clone https://github.com/Jadiouo/harness-from-scratch.git
+cd harness-from-scratch
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env && chmod 600 .env     # then put your key in ANTHROPIC_API_KEY
