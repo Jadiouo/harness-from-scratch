@@ -184,3 +184,18 @@
 - 兩組都發現任務句寫錯路徑（WORKDIR 裡是 mini_repo/ 不是 sandbox/mini_repo），自行修正並在回答中說明。
 - summarize_log 誤判（真實踩到）：實驗組 log 印了 v3 判定且第 4 項顯示 ALL OK——v3 的開關原本是「整份 log 文字含 docstring_repo」，subagent 的 glob(**/*) 輸出含這個字；第 4 項又是讀 sandbox 現況而非 log。修：改看主對話的任務句（first_task_text）。pytest `240 passed`（含新測試）。
 - 已知限制（未修）：v3 第 4 項讀 sandbox 現況，事後換過 sandbox 再判舊 log 會不準。
+
+## v4-4 hooks（pre_tool_use／post_tool_use）
+- 設計（定案）：`.agent/hooks.json`（專案根、WORKDIR 外、gitignore），main 啟動時載入一次；matcher fullmatch 工具名；shell 指令、cwd＝專案根、stdin JSON、env 同 bash 清理＋AGENT_WORKDIR；exit 0 放行、2 pre 擋下／post 回報（不設 is_error，觀察點）、其他 fail-open 並警告。順序：權限層→pre→工具→post；pre 擋下與 deny 一樣觸發同批略過；subagent 也跑 hooks。
+- 實驗：post hook `fixtures/hooks/no_print_hook.py`（shop/ 禁用 print、要 logging），任務句不提規則。
+
+### v4-4 審查第 1 輪（sonnet，乾淨上下文）
+- 驗證：pytest `263 passed`；指揮官手動餵 hook 腳本：print → exit 2、logging → exit 0。
+- 必改（皆採納）：非 UTF-8 hook 輸出／surrogate payload 丟未接住的例外 → 工具已執行卻被標「未執行」，改 errors=replace、ensure_ascii、except Exception fail-open；hook stderr 無上限整段進 tool_result → 截斷 2000 字。
+- 建議（皆採納）：HOOKS_FILE 相對路徑對專案根解析；hook log 直接記 path（judge 優先用、normpath 正規化）；文件補「hook 腳本每次重讀，allow_all 下模型可改腳本」；補 OSError/非 UTF-8/surrogate/巨量輸出測試。
+- 修正後驗證：pytest `270 passed`；指揮官實測非 UTF-8 stderr 的 post hook → 回報附加、工具結果保留、不崩。進真實測驗。
+
+### v4-4 真實測驗（logs/v4-hooks-run1.jsonl）— 通過
+- v4-hooks 判定全 PASS：第 3 輪模型用 `print(..., file=sys.stderr)` → hook exit 2 ×2（回報行號＋規則）→ 第 4 輪模型說「依專案規定，把 print 改成 logging」，加 import logging／logger、改 logger.debug → 同批第 1 個 edit 時另一處 print 還在（exit 2），後兩個 edit 後 exit 0。最終 orders.py 無 print。
+- post 回報**沒設 is_error**，模型仍注意到並修正——尾端附文字的回饋就足夠。
+- 模型自行驗證 A17 失敗是既有的：在 /tmp 做一份去掉改動的副本跑基準（bash 經詢問、使用者回 a）。觀察：這條指令寫到 WORKDIR 外（/tmp），權限層有攔下詢問，屬人核准；同 v3 的「a 等同一次性 y，要讀內容」提醒。

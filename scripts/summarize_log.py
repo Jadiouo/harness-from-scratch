@@ -1,7 +1,7 @@
 """把 logs/*.jsonl 摘要成一輪一行，結尾自動判定 v1／v2／v3／v4 完成標準。
 subagent 的 log 行（帶 "agent": "sub"）不進任何既有判定與每輪摘要，只給 v4-subagent 判定用；舊 log 沒有這個欄位，一律視為主對話。
 用法：summarize_log.py [log路徑] [--repo sandbox/mini_repo] [--fixture fixtures/mini_repo]"""
-import argparse, difflib, json, os, posixpath, re, subprocess, sys
+import argparse, ast, difflib, json, os, posixpath, re, subprocess, sys
 from collections import Counter
 from pathlib import Path
 
@@ -346,6 +346,48 @@ def judge_subagent(path):
            f"主對話在第一次 task 之後自己又 grep/glob/read_file（重做搜尋）：{len(redo)} 次" + "".join(f"\n        {r}" for r in redo)]
     return res, obs
 
+# ==== v4-hooks：主對話 log 裡有 "hook" 行（agent.py 的 run_hooks 寫的）才判定 ====
+def judge_hooks(path, repo):
+    """沒有 hook 行回 None。回傳 (判定, 觀察文字列表)。路徑優先用 hook 行自己的 path；舊 log 沒有此欄位就退回前面最近一個 permission 行的 input.path。"""
+    rows = read_rows(path)
+    hooks, cur = [], None   # hooks: (列號, 路徑, hook 記錄)
+    for i, d in enumerate(rows):
+        if "permission" in d:
+            cur = d["permission"].get("input", {}).get("path")
+        elif "hook" in d:
+            p = d["hook"]["path"] if "path" in d["hook"] else cur
+            hooks.append((i, os.path.normpath(p) if p else p, d["hook"]))   # normpath：./a.py 與 a.py 視為同一檔
+    if not hooks:
+        return None
+    posts = [h for h in hooks if h[2].get("event") == "post_tool_use" and h[2].get("tool") in ("edit", "write_file")]
+    hit = [h for h in hooks if h[2].get("exit") == 2]
+    files = sorted({f for _, f, _ in posts if f and any(x[1] == f and x[2].get("exit") == 2 for x in posts)})
+    last_ok = {f: [h for h in posts if h[1] == f][-1][2].get("exit") == 0 for f in files}
+    # 讀的是 sandbox 現況，不是 log 當時的內容：跑完之後有人手動改過就會不一致
+    shop, bad = repo / "shop", []
+    for f in sorted(shop.rglob("*.py")) if shop.is_dir() else []:
+        try:
+            tree_ = ast.parse(f.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            bad.append(f"{f.relative_to(repo)}（無法解析）")
+            continue
+        bad += [f"{f.relative_to(repo)}:{n.lineno}" for n in ast.walk(tree_)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "print"]
+    res = [(bool(hit), f"1. 至少一次 hook exit 2，規則有觸發（實際 {len(hit)} 次）", ""),
+           (bool(files) and all(last_ok.values()), f"2. 觸發過的檔案，最後一次 post hook 為 exit 0（模型修好了）：{last_ok or '沒有觸發過的檔案'}", ""),
+           (shop.is_dir() and not bad, f"3. 最終 sandbox 的 {shop.name}/ 沒有 print 呼叫（用 ast 掃 {repo} 現況，不是 log 當時的內容）",
+            f"{shop} 不存在" if not shop.is_dir() else "\n".join(bad))]
+    # 觀察：每次 exit 2 之後，模型下一個回應做了什麼
+    nxt = []
+    for i, f, h in hit:
+        resp = next((d["response"] for d in rows[i + 1:] if "response" in d), None)
+        calls = [f"{b['name']}({brief(b.get('input', {}))})" for b in (resp or {}).get("content", []) if b.get("type") == "tool_use"]
+        nxt.append(f"hook exit 2（{f or '?'}）之後：{'; '.join(calls) or '(無工具呼叫，直接回覆或結束)'}")
+    subs = [d for d in read_rows(path, sub=True) if "hook" in d]
+    obs = [f"hook 總次數 {len(hooks)}（exit 分布 {dict(Counter(str(h[2].get('exit')) for h in hooks))}），總耗時 {sum(h[2].get('ms', 0) for h in hooks)} ms；subagent 另有 {len(subs)} 次（不計入判定）",
+           *nxt]
+    return res, obs
+
 def exit_code(res):
     """任何判定 FAIL 回 1，否則 0（2 另表「log 不可用」）。以前直接回 res 這個 list，和 2 比較永遠不等，FAIL 也 exit 0。"""
     return 0 if all(ok for ok, _, _ in res) else 1
@@ -469,6 +511,18 @@ def main(argv):
         print("觀察（不判 PASS/FAIL）：4.")
         print("".join(f"    {o}\n" for o in obs), end="")
         print("結果:", "全部通過" if all(ok for ok, _, _ in res) else "有未通過項目")
+    res_hooks = judge_hooks(path, repo)
+    if res_hooks:
+        res, obs = res_hooks
+        allres += res
+        print("--- v4-hooks 判定 ---")
+        for ok, label, detail in res:
+            print(f"{'✅ PASS' if ok else '❌ FAIL'} {label}")
+            if detail:
+                print("    " + detail.replace("\n", "\n    "))
+        print("觀察（不判 PASS/FAIL）：4.")
+        print("".join(f"    {o}\n" for o in obs), end="")
+        print("結果:", "全部通過" if all(ok for ok, _, _ in res) else "有未通過項目")
     # 只看使用者的任務句：整份 log 文字會含工具輸出（例如 subagent 的 glob 列出 docstring_repo），用它判斷會誤開 v3 判定
     if "docstring_repo" in first_task_text(path):   # v3 判定不受下面 v1 防呆影響
         print("--- v3 完成標準判定 ---")
@@ -488,6 +542,9 @@ def main(argv):
             return exit_code(allres)
     if res_sub:   # v3 判定只看主對話行，照跑；v1 是修 bug 判定，這類唯讀問答 log 不適用
         print("（有 subagent 呼叫，略過 v1 判定：這類 log 是唯讀問答）")
+        return exit_code(allres)
+    if res_hooks:   # 這個實驗的 mini_repo 本來就有已知 bug，任務也不是修它，v1 判定一定 FAIL 且會誤導；看「沒有新增失敗」要自己對照 check.py 原始輸出
+        print("（有 hook 行，略過 v1 判定：mini_repo 的已知 bug 不在這個實驗範圍）")
         return exit_code(allres)
     # 沒成功呼叫 API 時不會有新 log，latest_log() 會默默撿到舊任務的 log，判定結果看似有效但不是這次的
     if repo.is_dir() and repo.stat().st_mtime > path.stat().st_mtime:

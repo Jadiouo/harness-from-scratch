@@ -45,6 +45,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "SESSION_MEMORY", None)
     monkeypatch.setattr(agent, "TODOS", [])
     monkeypatch.setattr(agent, "SUB_COUNT", 0)
+    monkeypatch.setattr(agent, "HOOKS", {e: [] for e in agent.HOOK_EVENTS})   # hooks 測試自己用 set_hooks 設定
+    monkeypatch.setattr(agent, "HOOKS_FILE", tmp_path / "no-hooks.json")   # 不要讀到使用者真實的 .agent/hooks.json
     monkeypatch.setattr(agent, "COMPACT_AT_TOKENS", 20000)   # 預設值是給真實測驗用的 8000；單元測試用固定值
     return tmp_path
 
@@ -1816,3 +1818,330 @@ def test_v3_judge_gated_on_task_text_not_tool_output(tmp_path, capsys):
     p.write_text("\n".join(json.dumps(r) for r in rows))
     summarize_log.main([str(p)])
     assert "v3 完成標準判定" not in capsys.readouterr().out
+
+
+# ==== v4：hooks ====
+def hook_cmd(tmp_path, name, body):
+    f = tmp_path / f"{name}.py"
+    f.write_text("import sys, json, os\n" + body)
+    return f"{sys.executable} {f}"
+
+def set_hooks(monkeypatch, pre=(), post=()):
+    monkeypatch.setattr(agent, "HOOKS", {"pre_tool_use": [{"matcher": m, "command": c} for m, c in pre],
+                                         "post_tool_use": [{"matcher": m, "command": c} for m, c in post]})
+
+def hook_rows(log):
+    return [json.loads(l) for l in log.read_text().splitlines() if '"hook"' in l]
+
+def test_load_hooks_missing_bad_and_good(env, monkeypatch, capsys):
+    assert agent.load_hooks() == {"pre_tool_use": [], "post_tool_use": []} and capsys.readouterr().out == ""
+    f = env / "h.json"
+    monkeypatch.setattr(agent, "HOOKS_FILE", f)
+    for bad in ["{not json", "[]", '{"pre_tool_use": {}}', '{"other": []}',
+                '{"pre_tool_use": [{"matcher": "bash", "command": "true"}, {"matcher": "(", "command": "true"}]}',
+                '{"post_tool_use": [{"matcher": "x"}]}']:
+        f.write_text(bad)
+        assert agent.load_hooks() == {"pre_tool_use": [], "post_tool_use": []}   # 不部分載入：連前面正確的那條都不要
+        assert "不載入任何 hook" in capsys.readouterr().out
+    f.write_text('{"pre_tool_use": [{"matcher": "bash", "command": "true"}]}')
+    assert agent.load_hooks() == {"pre_tool_use": [{"matcher": "bash", "command": "true"}], "post_tool_use": []}
+
+def test_matcher_is_fullmatch(env, monkeypatch):
+    cmd = hook_cmd(env, "m", "sys.exit(2)")
+    set_hooks(monkeypatch, pre=[("edit", cmd)])
+    _, messages, _ = run([msg([tool("a", "write_file", path="a.txt", content="1"), tool("b", "edit", path="a.txt", old_string="1", new_string="2")], "tool_use"),
+                          msg([text("ok")], "end_turn")], env)
+    assert (agent.WORKDIR / "a.txt").read_text() == "1"   # write_file 沒被 "edit" 擋；edit 被擋所以還是 1
+    r = messages[2]["content"]
+    assert "is_error" not in r[0] and r[1]["is_error"]
+    set_hooks(monkeypatch, pre=[("ed", cmd), ("e.*|write", cmd)])
+    assert agent.run_hooks("pre_tool_use", "edit", {}, env / "l", 1) != []   # "e.*|write" fullmatch edit
+    assert agent.run_hooks("pre_tool_use", "write_file", {}, env / "l", 1) == []   # "write" 不 fullmatch write_file
+
+def test_pre_exit2_blocks_and_tool_not_run(env, monkeypatch):
+    cmd = hook_cmd(env, "p", "print('不准寫', file=sys.stderr); sys.exit(2)")
+    set_hooks(monkeypatch, pre=[("write_file", cmd)])
+    _, messages, log = run([msg([tool("a", "write_file", path="a.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert not (agent.WORKDIR / "a.txt").exists()
+    r = messages[2]["content"][0]
+    assert r["is_error"] and r["content"].startswith("hook 擋下（") and "不准寫" in r["content"]
+    check_pairing(messages)
+    row = hook_rows(log)[0]["hook"]
+    assert row["exit"] == 2 and row["decision"] == "block" and row["event"] == "pre_tool_use" and "不准寫" in row["stderr"] and "ms" in row
+
+def test_pre_exit0_allows_and_gets_json_stdin(env, monkeypatch):
+    out = env / "seen.json"
+    cmd = hook_cmd(env, "p0", f"open({str(out)!r}, 'w').write(sys.stdin.read())")
+    set_hooks(monkeypatch, pre=[(".*", cmd)])
+    _, messages, _ = run([msg([tool("a", "write_file", path="a.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert (agent.WORKDIR / "a.txt").read_text() == "1" and "is_error" not in messages[2]["content"][0]
+    seen = json.loads(out.read_text())
+    assert seen == {"event": "pre_tool_use", "tool": "write_file", "input": {"path": "a.txt", "content": "1"}, "workdir": str(agent.WORKDIR)}
+
+def test_post_exit2_appends_report_keeps_result_and_is_error(env, monkeypatch):
+    out = env / "seen.json"
+    cmd = hook_cmd(env, "q", f"open({str(out)!r}, 'w').write(sys.stdin.read()); print('請改 logging', file=sys.stderr); sys.exit(2)")
+    set_hooks(monkeypatch, post=[("bash", cmd)])
+    _, messages, _ = run([msg([tool("a", "bash", command="echo HELLO; exit 3")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    r = messages[2]["content"][0]
+    assert "HELLO" in r["content"] and "exit code: 3" in r["content"]   # 工具結果保留
+    assert r["content"].endswith("\n\n[post_tool_use hook 回報]\n請改 logging")
+    assert "is_error" not in r   # 刻意不設 is_error
+    seen = json.loads(out.read_text())
+    assert seen["event"] == "post_tool_use" and seen["result"]["is_error"] is False and "HELLO" in seen["result"]["content"]
+
+def test_post_hook_result_content_capped_at_2000(env, monkeypatch):
+    out = env / "seen.json"
+    set_hooks(monkeypatch, post=[("bash", hook_cmd(env, "c", f"open({str(out)!r}, 'w').write(sys.stdin.read())"))])
+    run([msg([tool("a", "bash", command="python3 -c \"print('x'*5000)\"")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert len(json.loads(out.read_text())["result"]["content"]) == 2000
+
+def test_other_exit_timeout_and_missing_command_fail_open(env, monkeypatch, capsys):
+    monkeypatch.setattr(agent, "HOOK_TIMEOUT", 1)
+    cmds = [hook_cmd(env, "e1", "print('壞了', file=sys.stderr); sys.exit(1)"),
+            hook_cmd(env, "e2", "import time; time.sleep(5)"),
+            "/nonexistent-hook-binary"]
+    set_hooks(monkeypatch, pre=[("write_file", c) for c in cmds])
+    _, messages, log = run([msg([tool("a", "write_file", path="a.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert (agent.WORKDIR / "a.txt").read_text() == "1" and "is_error" not in messages[2]["content"][0]   # 照常執行
+    out = capsys.readouterr().out
+    assert out.count("⚠ hook 失敗") == 3 and "壞了" in out
+    rows = [r["hook"] for r in hook_rows(log)]
+    assert [r["decision"] for r in rows] == ["error"] * 3 and rows[1]["exit"] == "timeout" and rows[2]["exit"] == 127
+
+def test_multiple_hooks_run_in_order_and_pre_block_stops(env, monkeypatch):
+    trace = env / "trace"
+    mk = lambda n, code: hook_cmd(env, n, f"open({str(trace)!r}, 'a').write('{n}'); sys.exit({code})")
+    set_hooks(monkeypatch, pre=[("bash", mk("A", 0)), ("bash", mk("B", 2)), ("bash", mk("C", 0))], post=[("bash", mk("X", 2)), ("bash", mk("Y", 2))])
+    _, messages, _ = run([msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert trace.read_text() == "AB" and messages[2]["content"][0]["is_error"]   # B 擋下，C 不跑，post 也不跑
+    trace.unlink()
+    set_hooks(monkeypatch, post=[("bash", mk("X", 2)), ("bash", mk("Y", 2))])
+    run([msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert trace.read_text() == "XY"   # post 的 exit 2 不中斷後面的 hook
+
+def test_permission_deny_and_user_refusal_run_no_hooks(ask_env, monkeypatch):
+    trace = agent.WORKDIR.parent / "trace"
+    cmd = hook_cmd(agent.WORKDIR.parent, "t", f"open({str(trace)!r}, 'a').write('x')")
+    set_hooks(monkeypatch, pre=[(".*", cmd)], post=[(".*", cmd)])
+    ask_env("n", "")
+    run([msg([tool("g", "glob", pattern="../*"), tool("a", "edit", path="a.py", old_string="1", new_string="2")], "tool_use"), msg([text("ok")], "end_turn")], None)
+    assert not trace.exists()   # deny 與同批連帶略過
+    put("b.py", "x = 1\n")
+    run([msg([tool("a", "edit", path="b.py", old_string="x = 1", new_string="x = 2")], "tool_use"), msg([text("ok")], "end_turn")], None)
+    assert not trace.exists() and (agent.WORKDIR / "b.py").read_text() == "x = 1\n"   # 使用者拒絕
+
+def test_pre_block_skips_rest_of_batch_like_deny(env, monkeypatch):
+    set_hooks(monkeypatch, pre=[("write_file", hook_cmd(env, "b", "sys.exit(2)"))])
+    _, messages, log = run([msg([tool("a", "write_file", path="a.txt", content="1"),
+                                 tool("b", "bash", command="echo second"),
+                                 tool("c", "write_file", path="c.txt", content="3")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    r = messages[2]["content"]
+    assert [x["tool_use_id"] for x in r] == ["a", "b", "c"] and all(x["is_error"] for x in r)
+    assert "同一批中前面的 write_file" in r[1]["content"] and "同一批中前面的 write_file" in r[2]["content"]
+    assert [p["decision"] for p in perms_of(log)] == ["allow", "skipped", "skipped"]
+    assert len(hook_rows(log)) == 1   # 被略過的不跑 hook
+    check_pairing(messages)
+
+def test_post_exit2_does_not_skip_rest_of_batch(env, monkeypatch):
+    set_hooks(monkeypatch, post=[("write_file", hook_cmd(env, "b", "sys.exit(2)"))])
+    _, messages, _ = run([msg([tool("a", "write_file", path="a.txt", content="1"), tool("b", "write_file", path="b.txt", content="2")], "tool_use"),
+                          msg([text("ok")], "end_turn")], env)
+    assert (agent.WORKDIR / "b.txt").exists() and "is_error" not in messages[2]["content"][1]
+
+def test_hook_env_has_no_anthropic_but_has_agent_workdir(env, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "SECRET-KEY")
+    out = env / "env.json"
+    set_hooks(monkeypatch, pre=[("bash", hook_cmd(env, "v", f"open({str(out)!r}, 'w').write(json.dumps(dict(os.environ)))"))])
+    run([msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    e = json.loads(out.read_text())
+    assert not [k for k in e if k.startswith("ANTHROPIC_")] and e["AGENT_WORKDIR"] == str(agent.WORKDIR)
+
+def test_hook_cwd_is_project_root(env, monkeypatch):
+    out = env / "cwd"
+    set_hooks(monkeypatch, pre=[("bash", hook_cmd(env, "w", f"open({str(out)!r}, 'w').write(os.getcwd())"))])
+    run([msg([tool("a", "bash", command="echo hi")], "tool_use"), msg([text("ok")], "end_turn")], env)
+    assert out.read_text() == str(agent.ROOT)
+
+def test_subagent_tools_run_hooks_and_log_sub_fields(env, monkeypatch):
+    put("a.py", "x = 1\n")
+    set_hooks(monkeypatch, pre=[("grep", hook_cmd(env, "g", "print('不准搜', file=sys.stderr); sys.exit(2)"))],
+              post=[("read_file", hook_cmd(env, "r", "print('讀到了', file=sys.stderr); sys.exit(2)"))])
+    sub = [msg([tool("s1", "grep", pattern="x")], "tool_use"), msg([tool("s2", "read_file", path="a.py")], "tool_use"), msg([text("結論")], "end_turn")]
+    client, _, log = run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], sub, env)
+    assert "hook 擋下" in sub_result(client, 1)[0]["content"] and sub_result(client, 1)[0]["is_error"]
+    got = sub_result(client, 2)[0]["content"]
+    assert "x = 1" in got and "[post_tool_use hook 回報]\n讀到了" in got
+    rows = hook_rows(log)
+    assert [(r["agent"], r["sub_id"], r["hook"]["tool"]) for r in rows] == [("sub", 1, "grep"), ("sub", 1, "read_file")]
+
+def test_task_tool_itself_goes_through_matcher(env, monkeypatch):
+    set_hooks(monkeypatch, pre=[("task", hook_cmd(env, "t", "sys.exit(2)"))])
+    client, messages, _ = run2([msg([task_call()], "tool_use"), msg([text("ok")], "end_turn")], [], env)
+    assert client.sub.calls == [] and messages[2]["content"][0]["is_error"]
+
+def test_main_loads_hooks_prints_count_and_hooks_command(env, monkeypatch, capsys):
+    f = env / "h.json"
+    f.write_text(json.dumps({"pre_tool_use": [{"matcher": "bash", "command": "true"}],
+                             "post_tool_use": [{"matcher": "edit|write_file", "command": "python3 x.py"}, {"matcher": ".*", "command": "true"}]}))
+    monkeypatch.setattr(agent, "HOOKS_FILE", f)
+    repl(monkeypatch, FakeClient([]), ["/hooks", "/exit"])
+    out = capsys.readouterr().out
+    assert "🪝 已載入 3 個 hooks（pre 1、post 2）" in out
+    assert "post_tool_use  edit|write_file  →  python3 x.py" in out and "下次啟動才生效" in out
+
+def test_main_without_hooks_file_prints_nothing(env, monkeypatch, capsys):
+    repl(monkeypatch, FakeClient([]), ["/hooks", "/exit"])
+    out = capsys.readouterr().out
+    assert "🪝" not in out and "本 session 沒有載入 hooks" in out
+
+def test_main_bad_hooks_file_warns_and_loads_nothing(env, monkeypatch, capsys):
+    f = env / "h.json"; f.write_text("{oops")
+    monkeypatch.setattr(agent, "HOOKS_FILE", f)
+    repl(monkeypatch, FakeClient([]), ["/hooks", "/exit"])
+    out = capsys.readouterr().out
+    assert "[警告]" in out and "🪝 已載入" not in out and "本 session 沒有載入 hooks" in out
+
+
+# ---- fixtures/hooks/no_print_hook.py 本身 ----
+NO_PRINT = Path(__file__).resolve().parent.parent / "fixtures" / "hooks" / "no_print_hook.py"
+
+def run_no_print(tmp_path, tool_name, path, code):
+    f = tmp_path / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(code)
+    import subprocess
+    payload = json.dumps({"event": "post_tool_use", "tool": tool_name, "input": {"path": path}, "workdir": str(tmp_path)})
+    return subprocess.run([sys.executable, str(NO_PRINT)], input=payload, capture_output=True, text=True,
+                          env={**os.environ, "AGENT_WORKDIR": str(tmp_path)})
+
+def test_no_print_hook(tmp_path):
+    r = run_no_print(tmp_path, "edit", "mini_repo/shop/orders.py", "def f():\n    print(1)\n")
+    assert r.returncode == 2 and "mini_repo/shop/orders.py:2 使用了 print()" in r.stderr and "logging" in r.stderr
+    r = run_no_print(tmp_path, "write_file", "mini_repo/shop/x.py", "def f(:\n")
+    assert r.returncode == 2 and "語法錯誤" in r.stderr
+    assert run_no_print(tmp_path, "edit", "mini_repo/shop/ok.py", "import logging\nlogger = logging.getLogger(__name__)\nx = 'print(1)'\n").returncode == 0
+    assert run_no_print(tmp_path, "edit", "mini_repo/utils/u.py", "print(1)\n").returncode == 0   # shop/ 以外
+    assert run_no_print(tmp_path, "edit", "mini_repo/shop/notes.txt", "print(1)\n").returncode == 0   # 非 .py
+    assert run_no_print(tmp_path, "bash", "mini_repo/shop/b.py", "print(1)\n").returncode == 0   # 非 edit/write_file
+    assert not list(tmp_path.rglob("__pycache__"))
+
+def test_hooks_json_fixture_is_valid(env, monkeypatch):
+    monkeypatch.setattr(agent, "HOOKS_FILE", NO_PRINT.parent / "hooks.json")
+    h = agent.load_hooks()
+    assert h["pre_tool_use"] == [] and h["post_tool_use"][0]["matcher"] == "edit|write_file"
+
+
+# ---- summarize_log 的 v4-hooks 判定 ----
+def hooks_log(tmp_path, exits, shop_code, with_sub=True):
+    """exits: 依序每個 post hook 的 exit（都是同一個檔 shop/orders.py）。"""
+    rows = []
+    for i, code in enumerate(exits):
+        rows += [{"turn": i + 1, "permission": {"id": f"t{i}", "tool": "edit", "input": {"path": "mini_repo/shop/orders.py"}, "decision": "allow"}},
+                 {"turn": i + 1, "hook": {"event": "post_tool_use", "tool": "edit", "command": "c", "exit": code, "stderr": "", "ms": 10, "decision": "x"}},
+                 {"turn": i + 1, "response": {"content": [{"type": "tool_use", "id": f"n{i}", "name": "bash", "input": {"command": "python3 check.py"}}], "stop_reason": "tool_use"}}]
+    if with_sub:
+        rows.append({"agent": "sub", "sub_id": 1, "turn": 1, "hook": {"event": "pre_tool_use", "tool": "grep", "command": "c", "exit": 2, "stderr": "", "ms": 1, "decision": "block"}})
+    tmp_path.mkdir(exist_ok=True)
+    log = tmp_path / "h.jsonl"
+    log.write_text("\n".join(json.dumps(r) for r in rows))
+    repo = tmp_path / "sandbox" / "mini_repo"
+    (repo / "shop").mkdir(parents=True)
+    (repo / "shop" / "orders.py").write_text(shop_code)
+    return log, repo
+
+def import_summarize():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import summarize_log
+    return summarize_log
+
+def test_summarize_hooks_pass(tmp_path):
+    log, repo = hooks_log(tmp_path, [2, 0], "import logging\n")
+    res, obs = import_summarize().judge_hooks(log, repo)
+    assert [ok for ok, _, _ in res] == [True, True, True]
+    assert "hook 總次數 2" in obs[0] and "subagent 另有 1 次" in obs[0]   # sub 的 hook 不計入主對話判定
+    assert "bash(python3 check.py)" in obs[1]
+
+def test_summarize_hooks_fail_cases(tmp_path):
+    sl = import_summarize()
+    log, repo = hooks_log(tmp_path, [2, 2], "print(1)\n")   # 最後一次仍 exit 2、檔案裡還有 print
+    assert [ok for ok, _, _ in sl.judge_hooks(log, repo)[0]] == [True, False, False]
+    log, repo = hooks_log(tmp_path / "b", [0, 0], "x = 1\n")
+    assert [ok for ok, _, _ in sl.judge_hooks(log, repo)[0]] == [False, False, True]   # 規則從未觸發
+
+def test_summarize_no_hook_rows_returns_none_and_main_skips_v1(tmp_path, capsys):
+    sl = import_summarize()
+    log = tmp_path / "n.jsonl"; log.write_text(json.dumps({"turn": 1, "response": {"content": []}}))
+    assert sl.judge_hooks(log, tmp_path) is None
+    log, repo = hooks_log(tmp_path / "c", [2, 0], "import logging\n", with_sub=False)
+    code = sl.main([str(log), "--repo", str(repo)])
+    out = capsys.readouterr().out
+    assert "--- v4-hooks 判定 ---" in out and "略過 v1 判定" in out and "v1 完成標準判定" not in out and code == 0
+
+
+# ==== v4：hooks 審查修正（fail-open 全例外、stderr 截斷、相對路徑、log path）====
+def _one_write(env):
+    return run([msg([tool("a", "write_file", path="a.txt", content="1")], "tool_use"), msg([text("ok")], "end_turn")], env)
+
+def test_hook_oserror_fails_open(env, monkeypatch):
+    set_hooks(monkeypatch, pre=[("write_file", "true")])
+    def boom(*a, **k): raise PermissionError("nope")
+    monkeypatch.setattr(agent.subprocess, "run", boom)
+    _, messages, log = _one_write(env)
+    assert (agent.WORKDIR / "a.txt").read_text() == "1" and "is_error" not in messages[2]["content"][0]
+    check_pairing(messages)
+    assert hook_rows(log)[0]["hook"]["decision"] == "error"
+
+def test_hook_non_utf8_output_fails_open_not_crash(env, monkeypatch):
+    cmd = "printf '\\377\\376' >&2; exit 2"
+    set_hooks(monkeypatch, post=[("write_file", cmd)])
+    _, messages, log = _one_write(env)
+    r = messages[2]["content"][0]
+    assert (agent.WORKDIR / "a.txt").read_text() == "1" and not r.get("is_error") and "[post_tool_use hook 回報]" in r["content"]
+    check_pairing(messages)
+    assert hook_rows(log)[0]["hook"]["decision"] == "block"   # 解碼用 replace，exit 2 照常算
+
+def test_hook_surrogate_payload_does_not_crash(env, monkeypatch):
+    out = env / "in.json"
+    set_hooks(monkeypatch, pre=[(".*", hook_cmd(env, "s", f"open({str(out)!r}, 'w').write(sys.stdin.read())"))])
+    assert agent.run_hooks("pre_tool_use", "read_file", {"path": "a\udc80"}, env / "l", 1) == []
+    assert json.loads(out.read_text())["input"]["path"] == "a\udc80"
+    assert hook_rows(env / "l")[0]["hook"]["decision"] == "ok"
+
+def test_hook_huge_stderr_truncated_in_pre_and_post(env, monkeypatch):
+    big = "print('X' * 500000, file=sys.stderr); sys.exit(2)"
+    set_hooks(monkeypatch, pre=[("write_file", hook_cmd(env, "bp", big))])
+    _, messages, _ = _one_write(env)
+    c = messages[2]["content"][0]["content"]
+    assert messages[2]["content"][0]["is_error"] and len(c) < agent.HOOK_FEEDBACK_CHARS + 200 and "截斷" in c
+    check_pairing(messages)
+    set_hooks(monkeypatch, post=[("write_file", hook_cmd(env, "bq", big))])
+    _, messages, _ = _one_write(env)
+    c = messages[2]["content"][0]["content"]
+    assert (agent.WORKDIR / "a.txt").exists() and len(c) < agent.HOOK_FEEDBACK_CHARS + 400 and "截斷" in c and "[post_tool_use hook 回報]" in c
+
+def test_hooks_file_relative_resolves_against_root_not_cwd(env, monkeypatch):
+    monkeypatch.setenv("HOOKS_FILE", "rel-hooks.json")
+    import importlib
+    try:
+        m = importlib.reload(agent)
+        assert m.HOOKS_FILE == m.ROOT / "rel-hooks.json"
+        monkeypatch.setenv("HOOKS_FILE", "/abs/h.json")
+        assert importlib.reload(agent).HOOKS_FILE == Path("/abs/h.json")
+    finally:
+        monkeypatch.delenv("HOOKS_FILE")
+        importlib.reload(agent)
+
+def test_hook_log_records_input_path(env, monkeypatch):
+    set_hooks(monkeypatch, pre=[(".*", "true")])
+    agent.run_hooks("pre_tool_use", "write_file", {"path": "a.py"}, env / "l", 1)
+    agent.run_hooks("pre_tool_use", "bash", {"command": "ls"}, env / "l", 1)
+    assert [r["hook"]["path"] for r in hook_rows(env / "l")] == ["a.py", None]
+
+def test_summarize_hooks_uses_own_path_and_normalizes(tmp_path):
+    sl = import_summarize()
+    rows = [{"turn": 1, "hook": {"event": "post_tool_use", "tool": "edit", "path": "./a.py", "exit": 2, "ms": 1}},
+            {"turn": 2, "hook": {"event": "post_tool_use", "tool": "edit", "path": "a.py", "exit": 0, "ms": 1}}]   # 沒有 permission 行
+    log = tmp_path / "p.jsonl"; log.write_text("\n".join(json.dumps(r) for r in rows))
+    res, _ = sl.judge_hooks(log, tmp_path)
+    assert res[1][0] is True and "a.py" in res[1][1]

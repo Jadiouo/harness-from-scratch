@@ -1,5 +1,5 @@
 """v4 迷你 coding agent：手寫 agent loop + 8 個工具（read_file/write_file/edit/grep/glob/bash/todo_write/task）+ 權限層 + 上下文壓縮 + 專案記憶（CLAUDE.md）+ subagent。不用框架、不用 SDK tool runner。"""
-import fnmatch, json, os, re, subprocess, sys
+import fnmatch, json, os, re, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
@@ -243,10 +243,12 @@ def glob(pattern):
     out = "\n".join(found[:MAX_RESULTS])
     return out + (f"\n[... 共 {len(found)} 筆，只顯示前 {MAX_RESULTS} 筆 ...]" if len(found) > MAX_RESULTS else "")
 
+def _clean_env():
+    # 子程序拿不到 ANTHROPIC_*：否則模型一句 `echo $ANTHROPIC_API_KEY` 就會把 key 帶進對話和 log（hooks 也共用這份）
+    return {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
+
 def bash(command, timeout=30):
-    # 子程序拿不到 ANTHROPIC_*：否則模型一句 `echo $ANTHROPIC_API_KEY` 就會把 key 帶進對話和 log
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
-    r = subprocess.run(command, shell=True, cwd=WORKDIR, env=env, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(command, shell=True, cwd=WORKDIR, env=_clean_env(), capture_output=True, text=True, errors="replace", timeout=timeout)
     return f"exit code: {r.returncode}\n--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
 
 # TODO 清單由 harness 持有（模組層），不是由模型的記憶或對話歷史持有：壓縮會把歷史換掉，/reset 也要能一次清乾淨。
@@ -410,6 +412,91 @@ def authorize(block):
             print("✅ 已允許")
     return result, {"id": block.id, "tool": name, "input": args, "decision": decision, "answer": answer, "reason": reason}
 
+# ==== 【harness 角色：hooks】使用者自己的程式，掛在工具執行前後；權限層是寫死的規則，hook 是可換的規則 ====
+# 順序：權限層先、pre hook 後、執行工具、post hook。被權限層拒絕的呼叫不跑任何 hook（工具不會執行，沒有東西可檢查）。
+# hook 是使用者寫的程式、使用者信任，所以不經權限層詢問；但 ANTHROPIC_* 仍要清掉（和 bash 工具同一份 env），免得 key 漏進 hook 的 log。
+# 設定檔在 WORKDIR 外：檔案工具的路徑 deny 擋得住模型改它；bash 想碰 `..`／絕對路徑會被權限層 ask；
+# 且只在 main 啟動時讀一次，所以 session 中模型無法改自己的 hooks（同 CLAUDE.md：一致、可預測；中途改要重啟）。
+# exit code：0 沒意見；2 pre 擋下（工具不執行）／post 回報（工具已執行）；其他 exit、逾時、無法執行 → 警告並照常繼續（fail-open）。
+# fail-open 的理由：hook 壞掉（打錯字、少裝套件）不該讓整個 agent 停擺；風險是「檢查默默失效」，所以一定印警告並寫 log。
+ROOT = Path(__file__).resolve().parent
+HOOKS_FILE = ROOT / (os.environ.get("HOOKS_FILE") or ".agent/hooks.json")   # 相對路徑對專案根解析（不是 cwd）；絕對路徑照用
+HOOK_EVENTS = ("pre_tool_use", "post_tool_use")
+HOOK_TIMEOUT = 30
+HOOK_FEEDBACK_CHARS = 2000   # hook 的 stderr 會進 tool_result 送上 API，不設上限一個吵的 hook 就能灌爆 context
+HOOKS = {e: [] for e in HOOK_EVENTS}   # main 載入；沒經過 main 的測試用空的
+
+def load_hooks():
+    """回傳 {event: [{"matcher", "command"}]}。沒有檔案回空；格式錯印警告、整份都不載入（不要部分載入）。"""
+    empty = {e: [] for e in HOOK_EVENTS}
+    if not HOOKS_FILE.is_file():
+        return empty
+    try:
+        data = json.loads(HOOKS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or set(data) - set(HOOK_EVENTS):
+            raise ValueError("最外層必須是物件，且只能有 pre_tool_use／post_tool_use")
+        for event, items in data.items():
+            if not isinstance(items, list):
+                raise ValueError(f"{event} 必須是陣列")
+            for h in items:
+                if not (isinstance(h, dict) and isinstance(h.get("matcher"), str) and isinstance(h.get("command"), str) and h["command"].strip()):
+                    raise ValueError(f"{event} 的每一項都要有字串 matcher 與非空 command")
+                re.compile(h["matcher"])
+    except (OSError, ValueError, re.error) as e:   # JSON／編碼錯誤都是 ValueError 的子類
+        print(f"[警告] hooks 設定檔 {HOOKS_FILE} 不能用（{type(e).__name__}: {e}），這個 session 不載入任何 hook")
+        return empty
+    return {**empty, **data}
+
+def run_hooks(event, name, args, log, turn, result=None, sub_id=None):
+    """依序跑 matcher 完全符合工具名的 hooks，回傳所有 exit 2 的 [(command, stderr)]；pre 有一個擋下就停。"""
+    payload = {"event": event, "tool": name, "input": args, "workdir": str(WORKDIR)}
+    if result is not None:
+        payload["result"] = {"content": str(result["content"])[:2000], "is_error": bool(result.get("is_error"))}
+    reports = []
+    for h in HOOKS[event]:
+        if not re.fullmatch(h["matcher"], name):
+            continue
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(h["command"], shell=True, cwd=ROOT, capture_output=True, text=True, errors="replace", timeout=HOOK_TIMEOUT,
+                               input=json.dumps(payload, default=to_jsonable),   # ensure_ascii：孤立 surrogate 在 UTF-8 編不出來
+                               env={**_clean_env(), "AGENT_WORKDIR": str(WORKDIR)})
+            code, err = r.returncode, r.stderr.strip()
+        except subprocess.TimeoutExpired:
+            code, err = "timeout", f"超過 {HOOK_TIMEOUT} 秒"
+        except OSError as e:
+            code, err = "error", f"{type(e).__name__}: {e}"
+        except Exception as e:
+            # hook 是外部程式，什麼怪事都可能發生（非 UTF-8 輸出、payload 編碼失敗…）；
+            # 這裡漏接的例外會讓「工具已執行」卻沒寫進歷史，close_dangling 會標成「未執行」，歷史就不實了。所以一律 fail-open
+            code, err = "error", f"{type(e).__name__}: {e}"
+        decision = "block" if code == 2 else "ok" if code == 0 else "error"
+        row = {"turn": turn, "hook": {"event": event, "tool": name, "command": h["command"], "path": args.get("path") if isinstance(args, dict) else None, "exit": code, "stderr": err[:300],
+                                      "ms": round((time.monotonic() - t0) * 1000), "decision": decision}}
+        with open(log, "a") as f:
+            f.write(json.dumps({"agent": "sub", "sub_id": sub_id, **row} if sub_id else row) + "\n")   # 預設 ensure_ascii：path 可能含孤立 surrogate
+        if decision == "error":
+            print(f"⚠ hook 失敗（exit {code}）：{h['command'][:60]}：{err[:200]}；照常繼續")
+        elif decision == "block":
+            reports.append((h["command"], err))
+            if event == "pre_tool_use":
+                break
+    return reports
+
+def call_with_hooks(block, log, turn, run, sub_id=None):
+    """權限層通過之後呼叫。run 是真正執行工具的函式；回傳 (tool_result, 是否被 pre hook 擋下)。"""
+    for cmd, err in run_hooks("pre_tool_use", block.name, block.input, log, turn, sub_id=sub_id):
+        print(f"🪝 hook 擋下 {block.name}：{err[:200]}")
+        return {"content": f"hook 擋下（{cmd[:60]}）：{truncate(err, HOOK_FEEDBACK_CHARS)}", "is_error": True}, True
+    result = run()
+    reports = run_hooks("post_tool_use", block.name, block.input, log, turn, result=result, sub_id=sub_id)
+    if reports:
+        # 刻意不設 is_error：工具確實成功了，hook 只是補充意見。觀察點：模型會不會自己注意到 content 尾端的回報
+        text = truncate("\n".join(err for _, err in reports), HOOK_FEEDBACK_CHARS)
+        print(f"🪝 post hook 回報：{text[:200]}")
+        result = {**result, "content": f"{result['content']}\n\n[post_tool_use hook 回報]\n{text}"}
+    return result, False
+
 # ==== 【harness 角色：紀錄】每輪 request/response 存成 jsonl，事後回放是最好的學習材料 ====
 def to_jsonable(o):
     # messages 裡混有 SDK 物件（pydantic），json 不認得，統一轉成 dict
@@ -507,7 +594,7 @@ def _sub_log(log, sub_id, row):
     with open(log, "a") as f:
         f.write(json.dumps({"agent": "sub", "sub_id": sub_id, **row}, ensure_ascii=False, default=to_jsonable) + "\n")
 
-def _sub_tool(block):
+def _sub_tool(block, log, turn, sub_id):
     # 不能在 subagent 裡跳出 input 詢問：不是 allow 一律當拒絕回 is_error
     if block.name not in {t["name"] for t in SUB_TOOLS}:
         return {"content": f"Error: subagent 沒有 {block.name} 這個工具，只能用 read_file、grep、glob", "is_error": True}
@@ -517,7 +604,8 @@ def _sub_tool(block):
         decision, reason = "deny", f"參數無法判斷（{e}）"
     if decision != "allow":
         return {"content": f"權限層拒絕：{reason}", "is_error": True}
-    return execute_tool(block.name, block.input)
+    # subagent 的工具呼叫跑同一套 hooks（共用函式）；pre 擋下沒有「同批略過」，因為這裡每個工具本來就各自獨立回結果
+    return call_with_hooks(block, log, turn, lambda: execute_tool(block.name, block.input), sub_id)[0]
 
 def run_subagent(client, prompt, log, sub_id):
     """跑一段全新的對話，回傳 tool_result 內容 {"content", ["is_error"]}。API 例外由 run_task 接住；Ctrl-C 直接往上拋，由主對話的 close_dangling 收尾。"""
@@ -547,7 +635,7 @@ def run_subagent(client, prompt, log, sub_id):
             if block.type != "tool_use":
                 continue
             print(f"  ↳ [sub] {block.name}({block.input.get('pattern') or block.input.get('path') or ''})")
-            r = _sub_tool(block)
+            r = _sub_tool(block, log, turn, sub_id)
             results.append({"type": "tool_result", "tool_use_id": block.id, **r})
             _sub_log(log, sub_id, {"turn": turn, "tool_result": {"id": block.id, "tool": block.name, "is_error": bool(r.get("is_error")),
                                    "content": str(r["content"])[:300], "chars": len(str(r["content"]))}})
@@ -744,7 +832,13 @@ def _loop(client, messages, log):
                     rejected = block.name if refusal else None
                 with open(log, "a") as f:
                     f.write(json.dumps({"turn": turn, "permission": perm}, ensure_ascii=False, default=to_jsonable) + "\n")
-                result = refusal or (run_task(client, block.input, log) if block.name == "task" else execute_tool(block.name, block.input))
+                if refusal:
+                    result = refusal
+                else:
+                    run = (lambda: run_task(client, block.input, log)) if block.name == "task" else (lambda: execute_tool(block.name, block.input))
+                    result, blocked = call_with_hooks(block, log, turn, run)
+                    # pre hook 擋下和權限層 deny / 使用者拒絕一樣算「被拒絕」，同批後面的略過（同一個計畫不做一半）
+                    rejected = block.name if blocked else rejected
                 if not refusal and block.name != "todo_write":   # todo_write 自己會印完整清單
                     print(f"  {result['content'][:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, **result})
@@ -802,7 +896,7 @@ def main():
         sys.exit(1)
     client = anthropic.Anthropic()   # 在這裡才建立，沒有 API key 時 import agent 不會爆
     log, messages = new_log_path(), []
-    global LAST_USAGE, COMPACT_COOLDOWN, SESSION_SYSTEM, SESSION_MEMORY, SUB_COUNT
+    global LAST_USAGE, COMPACT_COOLDOWN, SESSION_SYSTEM, SESSION_MEMORY, SUB_COUNT, HOOKS
     LAST_USAGE = None
     SUB_COUNT = 0
     COMPACT_COOLDOWN = 0
@@ -810,6 +904,9 @@ def main():
     SESSION_SYSTEM = build_system(SESSION_MEMORY)
     if SESSION_MEMORY:
         print(f"📒 已載入 {WORKDIR.name}/CLAUDE.md（{len(SESSION_MEMORY)} 字）")
+    HOOKS = load_hooks()
+    if n_hooks := sum(map(len, HOOKS.values())):
+        print(f"🪝 已載入 {n_hooks} 個 hooks（pre {len(HOOKS['pre_tool_use'])}、post {len(HOOKS['post_tool_use'])}）")
     if len(sys.argv) > 1:
         add_user_text(messages, " ".join(sys.argv[1:]))
         try:
@@ -841,6 +938,13 @@ def main():
         if text == "/memory":
             print(SESSION_MEMORY or "本 session 沒有載入 CLAUDE.md")
             print("（修改 CLAUDE.md 要下次啟動才生效）")
+            continue
+        if text == "/hooks":
+            for e, hs in HOOKS.items():
+                print("\n".join(f"{e}  {h['matcher']}  →  {h['command']}" for h in hs))
+            if not any(HOOKS.values()):
+                print("本 session 沒有載入 hooks")
+            print("（修改設定檔要下次啟動才生效）")
             continue
         if text == "/todo":
             print(render_todos() or "目前沒有 TODO")

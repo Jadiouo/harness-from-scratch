@@ -1,0 +1,1 @@
+{"post_tool_use": [{"matcher": "edit|write_file", "command": "python3 fixtures/hooks/no_print_hook.py"}]}

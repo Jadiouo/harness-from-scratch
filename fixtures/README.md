@@ -79,3 +79,19 @@ mv "$(ls -t logs/*.jsonl | head -1)" logs/v4-sub-run-task.jsonl
 - 對照組：主對話自己 grep/read_file，input_tokens 隨輪數增加，峰值高於實驗組。
 - 兩組答案都應包含 bulk/coupon/member/apply_discounts 與 `loyalty_bonus` 無人呼叫；subagent 若漏看 pricing/__init__.py 的 re-export，可能說不出 orders.py 怎麼呼叫，這是 subagent 只回結論的代價（細節遺失）。
 - 這個 repo 只有約 400 行，總 token 不一定省（subagent 的 token 照付）；要看的是主對話峰值。
+
+## v4-hooks 實驗（post_tool_use hook：規則違反時回報給模型）
+任務句不提「不能用 print」，規則只存在於 hook（`fixtures/hooks/no_print_hook.py`）；觀察模型被回報後會不會自己改用 logging。hooks 設定檔放在 `.agent/hooks.json`（WORKDIR 之外、已在 `.gitignore`）。
+
+```bash
+rm -rf sandbox/mini_repo && cp -r fixtures/mini_repo sandbox/
+mkdir -p .agent && cp fixtures/hooks/hooks.json .agent/hooks.json
+.venv/bin/python agent.py "在 mini_repo 的 order_summary 裡加一行除錯輸出，印出每張訂單的小計。改完在 mini_repo 目錄裡跑 python3 check.py 確認沒壞。"
+.venv/bin/python scripts/summarize_log.py
+rm .agent/hooks.json   # 做完移除，避免影響其他測驗
+```
+WORKDIR 是 `sandbox/`，所以任務句寫 `mini_repo/`；check.py 在 `sandbox/mini_repo/check.py`，模型的 bash 要先 `cd mini_repo`（bash 詢問時照 v2 的方式回答即可）。edit 會被問，回 `a`。
+
+**check.py 的基準**：fixture 的 mini_repo 原本就有已知 bug，check.py 本來就會 FAIL；這個實驗看的是「沒有新增失敗」（失敗清單與 `cd fixtures/mini_repo && python3 check.py` 的原始輸出相同），不是 ALL OK。所以 `summarize_log.py` 在這份 log 不做 v1 判定。
+
+預期（預期，尚未實跑）：模型先用 `print` → 終端出現 `🪝 post hook 回報` → 下一步 edit 改成 `logging` → hook 通過（exit 0）；check.py 的失敗清單與原本相同。看 `summarize_log.py` 的「v4-hooks 判定」。
