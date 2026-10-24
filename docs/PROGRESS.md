@@ -220,7 +220,7 @@
 - 改寫歷史：作者／提交者改 `Jadiouo <215644065+Jadiouo@users.noreply.github.com>`、移除 commit 的 Claude-Session 行（保留 Co-Authored-By）；審查檔中的 email 與家目錄字樣也從歷史中移除；scripts/sanitize_logs.py 改為執行時取得家目錄與使用者名，不寫死。本 repo 的 git user.email 設為 noreply。
 - 舊歷史只留在本機分支 backup/pre-rewrite（未推送）。
 - 推送 main 到 https://github.com/Jadiouo/coding-agent-from-scratch（PRIVATE）。重新 clone 驗證：78 個檔案，無 logs/、sandbox/、.env、.agent；全歷史掃描 email／家目錄／session 網址／key 皆 0。pytest `270 passed`。
-- 待使用者：在 GitHub 上看過後自行轉 public。
+- 2026-10-24 使用者要求後轉為 PUBLIC（公開前再掃一次遠端完整歷史：email／家目錄／session 網址／key 皆 0）。
 
 ## 改名與收尾（使用者決定）
 - repo 改名 harness-from-scratch（使用者：目的是了解 harness 的流程，「coding agent」不貼切）；README 標題與定位句改成以 harness 為主。上面歷史紀錄中的舊名保留不改。
