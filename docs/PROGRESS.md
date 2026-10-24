@@ -27,7 +27,7 @@
 ### 狀態
 - [x] repo、venv、anthropic 1.14.0
 - [x] v0 實作＋離線測試：審查第 1 輪必改項已修，pytest `13 passed`（指揮官重跑確認）
-- [x] 真實 API 跑「建立 hello.py 並執行」（log：logs/20261015-225449.jsonl）——**v0 完成標準通過**
+- [x] 真實 API 跑「建立 hello.py 並執行」（log：evidence/logs/20261015-225449.jsonl）——**v0 完成標準通過**
   - 3 輪，claude-opus-5-5，USE_FALLBACKS=1。第 1 輪一則回應含 write_file＋bash 兩個 tool_use；bash `python` 回 exit 127，模型讀 stderr 後第 2 輪改用 `python3` 成功；第 3 輪 end_turn 正確回報。
   - sandbox/hello.py 實際存在並可執行，輸出 `Hello, World!`。
   - 已確認：SDK 回應物件原樣放回 messages 可被 API 接受；歷史配對合法。
@@ -52,13 +52,13 @@
 - 已知未擋：模型仍可用 bash `cat ../.env` 讀到 key（路徑限制屬 v2）。
 - pytest `46 passed`。
 
-### v1 真實測驗 A（logs/v1-A-baseline.jsonl）
+### v1 真實測驗 A（evidence/logs/v1-A-baseline.jsonl）
 - 結果：1/2/3/5/6 PASS，4 FAIL。bug 正確修好（discounts.py `>`→`>=`，1 行），但 6 輪中 4 輪用 bash cat/find，第 4 輪 `for ... cat -n` 把 8 個檔全讀；grep/glob/read_file 0 次。input tokens 4818→8585。
 - 判斷：v1 完成標準「先搜再讀再精準改」未達成，屬工具重疊時模型偏好 bash，非程式 bug。
 - 實驗 B：只改 bash 工具描述（加「不要用 bash 讀檔/搜尋，改用專用工具」，仿 Claude Code），任務句不變。summarize 的繞過偵測補上 cat/head/tail/ls -R。
 - 另觀察：任務句「sandbox 裡的 mini_repo」讓模型第 1 輪 cd sandbox/mini_repo 失敗（WORKDIR 已是 sandbox）；為保持單一變數，B 組暫不改。
 
-### v1 真實測驗 B（logs/v1-B-bash-desc.jsonl）— v1 完成標準通過
+### v1 真實測驗 B（evidence/logs/v1-B-bash-desc.jsonl）— v1 完成標準通過
 - 6 項全 PASS。工具：glob 3、read_file 4、edit 1、bash 4（全用於執行 check.py／pwd，0 個繞過）。
 - 對照 A：只改 bash 描述一句，模型就從 bash cat/find 改用 glob＋read_file。
 - 預期落空：總 tokens 沒減少（A 31,830 → B 36,445）。原因：任務句路徑混淆在 B 浪費 2 輪（glob sandbox/mini_repo/** 找不到）；且仍是讀整檔（4 個檔），沒用 grep 定位。「搜尋」是靠 glob 列檔名猜到 discounts.py，不是內容搜尋。
@@ -76,7 +76,7 @@
 - 接受為已知限制：字串規則不是安全邊界，核准過的腳本可做任何事，需 OS sandbox；Ctrl-C 中斷時同回應中已執行的工具副作用不回滾。
 - 修補後 pytest `121 passed`（2026-10-24 重跑確認）。
 
-### v2 真實測驗第 1 次（logs/v2-run1-all-yes.jsonl）— 未達測驗條件
+### v2 真實測驗第 1 次（evidence/logs/v2-run1-all-yes.jsonl）— 未達測驗條件
 - 5 次 ask（edit 2、bash 3）全部回 y，沒有任何拒絕，所以「拒絕後改走別的路」沒被測到（判定 1、3 FAIL 是因為沒有 n，不是模型問題）。
 - 權限層行為正確：read_file/grep 自動放行；每次 edit 與 bash（python3 check.py）都有詢問。
 - 觀察：
@@ -85,7 +85,7 @@
   - 又踩一次 `python` → `python3`（跨 session 沒有記憶；v4 的 CLAUDE.md 載入可解）。
   - 核准疲勞：3 次 bash 指令只差一點點（`python` vs `python3`、多一段 `python3 -c`），「a＝完全相同指令」幫不上忙。Claude Code 用前綴規則（如 `Bash(python3 check.py:*)`）處理。候選改進，未定。
 
-### v2 真實測驗第 2 次（logs/v2-run2-reject.jsonl）— v2 完成標準通過（但「改走別的路」受拒絕理由混淆，見下；n=1）
+### v2 真實測驗第 2 次（evidence/logs/v2-run2-reject.jsonl）— v2 完成標準通過（但「改走別的路」受拒絕理由混淆，見下；n=1）
 - 4 項判定全 PASS。第 3 輪模型一次送出 3 個 tool_use：edit reports.py（使用者 n＋理由）、edit check.py（y）、bash 跑 check（n）。
 - 被拒絕後沒有重試，改為列出修改對照表並等待確認（這與當時填的拒絕理由「先把你打算怎麼改列給我看」一致，所以證明的是「模型會讀拒絕理由並照辦」；「理由留空時能否自己換方法」沒有測到）；且主動指出「同批的 check.py 已經被改了，reports.py 沒改，所以現在不一致，可以幫你改回去」。
 - 證據分級（降級）：此次拒絕理由本身就引導模型照做（混淆），所以「拒絕後改走別的路」只能讀成「模型會讀拒絕理由並照辦、不盲目重試」；光靠「被拒絕」這個事實是否會自己換方法，沒有隔離、沒有測到（要測需回 `n` 且理由留空並重跑）。屬單次行為觀察。
@@ -112,12 +112,12 @@
   4. 失憶偵測不準，根因是 log 沒記工具結果（壓縮後查不到）→ 每個 tool_result 寫 log；失憶定義改為「壓縮後重讀已改檔且之後沒再改」。
 - 確認無問題：tool_choice none 與 fallbacks 相容（SDK 有型別，推論未實打）；SESSION_ALLOW 壓縮後仍有效；壓縮在邊界做、失敗時歷史不變。
 
-### v3 真實測驗第 1 次（logs/v3-run1-bindfail.jsonl）— 未通過，兩個原因
+### v3 真實測驗第 1 次（evidence/logs/v3-run1-bindfail.jsonl）— 未通過，兩個原因
 - **摘要請求 400**：`Invalid signature in thinking block. The block is bound to a different conversation ... The system prompt differs`。官方文件（出處：Anthropic claude-api 文件的 model migration 指南「Breaking change 3」，preserved thinking；非公開網址，以文字出處為準）：thinking 簽章綁定 top-level system＋tools＋之前所有訊息；tool_choice、max_tokens 等不在綁定範圍。修：摘要請求沿用 SYSTEM_PROMPT 與 TOOLS（刪掉 SUMMARIZER_SYSTEM），只附加摘要指示、tool_choice none。我們的整段替換屬文件推薦的「simple compaction」形狀。冷卻機制如設計運作（失敗後未每輪重試）。pytest `154 passed`。
 - **測驗被繞過**：模型讀完 24 檔後，用一次 bash heredoc 在 /tmp 寫 Python 腳本批次插入全部 docstring（使用者回 a 核准）→ 工具呼叫 29 次、ALL OK，但 v3 要測的長任務沒出現。修：任務句加「請用 edit 工具一個函式一個函式修改，不要寫腳本批次處理」。
 - 觀察：腳本寫到 /tmp（WORKDIR 外）——權限層有詢問（含 heredoc 判 ask），是人核准的；顯示「a＝這條完全相同的指令」在長指令上等同一次性的 y，核准者要讀內容。
 
-### v3 真實測驗第 2 次（logs/v3-run2-pass.jsonl）— v3 完成標準通過（人為低門檻下的機制測試，n=1）
+### v3 真實測驗第 2 次（evidence/logs/v3-run2-pass.jsonl）— v3 完成標準通過（人為低門檻下的機制測試，n=1）
 - 證據分級（降級）：`COMPACT_AT_TOKENS=8000` 是人為壓低的門檻（真實模型上限高得多），任務句也被指定「用 edit 逐函式修改、不要寫腳本」。所以這次驗證的是「壓縮在密集觸發（4 次）下能運作並接得上任務」，**不是**「長任務不會爆 context」的上限證明，也沒測過沒有壓縮時會不會爆；「context 有界」只是相對於這個人為門檻。
 - 5 項全 PASS：16 輪、91 次工具呼叫（edit 56、read_file 31）、壓縮 4 次，主對話各輪 input 最高 9,858（4 次摘要請求本身的 input 最高 11,313），每次壓縮後回到約 3.7k–4.1k；ALL OK；失憶偵測 0。總 tokens 148k（主對話 102k＋摘要請求 46k）。
 - 觀察（未修，候選改進）：
@@ -139,8 +139,8 @@
 - 真實測驗見下節。
 
 ### v4-1 真實測驗（同一版程式，只差有沒有 sandbox/CLAUDE.md）— 通過
-- 有記憶（logs/v4-mem-with.jsonl）：第 1 輪就 `python3 hello.py`，2 輪完成；v4 判定全 PASS（system 2 個請求皆相同）。
-- 對照組無記憶（logs/v4-mem-control.jsonl）：第 2 輪 `python hello.py` 失敗，第 3 輪才 `python3`，4 輪完成。
+- 有記憶（evidence/logs/v4-mem-with.jsonl）：第 1 輪就 `python3 hello.py`，2 輪完成；v4 判定全 PASS（system 2 個請求皆相同）。
+- 對照組無記憶（evidence/logs/v4-mem-control.jsonl）：第 2 輪 `python hello.py` 失敗，第 3 輪才 `python3`，4 輪完成。
 - 結論（降級）：在這個任務、這一次，有 CLAUDE.md 省掉一次「重新發現環境限制」的試錯。樣本各 1 次（n=1），屬示範而非統計。
 
 ## v4-2 TODO 工具（todo_write）
@@ -154,14 +154,14 @@
 - 不採納：使用者輸入剛好以 `【目前 TODO】` 開頭會被吃掉（機率極低）；REPL 沒 /reset 時 TODOS 延續到下一任務（刻意：清單屬於 session，下一任務會整份取代；已寫進文件）。
 - 修正後驗證：pytest `206 passed`；指揮官實測 todo_write 正常、換行與多餘欄位皆 is_error、權限 allow。無必改項，進真實測驗。
 
-### v4-2 真實測驗第 1 次（logs/v4-todo-run1-nohint.jsonl）— 模型沒用 TODO
+### v4-2 真實測驗第 1 次（evidence/logs/v4-todo-run1-nohint.jsonl）— 模型沒用 TODO
 - 條件：只有工具描述引導，system prompt 只列工具名。
 - 結果：90 次工具呼叫（read_file 31、edit 56）、壓縮 4 次，todo_write **0 次**；v3 判定全 PASS（ALL OK），失憶偵測 0。
 - 解讀（推論）：任務本身有天然分段（按資料夾一批讀、一批改），模型不需要外部清單；只靠工具描述不足以讓它自發使用。
 - 觀察：壓縮後有 1 次原樣重讀（第 4→5 輪 geometry 6 檔），另外 3 次壓縮後直接 edit 沒重讀（摘要帶到足夠內容）。
 - 下一步：system prompt 加一句「三步以上先 todo_write 列清單、每完成一項更新、壓縮後照清單接著做」，同任務重跑當實驗組（對照組即本次）。pytest `206 passed`。
 
-### v4-2 真實測驗第 2 次（logs/v4-todo-run2-hint.jsonl，system prompt 加 TODO 提示）— 通過
+### v4-2 真實測驗第 2 次（evidence/logs/v4-todo-run2-hint.jsonl，system prompt 加 TODO 提示）— 通過
 - v4-TODO 判定 4 項全 PASS：第 2 輪就列 5 項清單（按資料夾＋最後驗證）；成功更新 6 次；最後全 completed；4 次壓縮都帶最新清單。v3 判定全 PASS（91 次工具呼叫、ALL OK、主對話各輪 input 最高 6,497；摘要請求本身最高 11,045）。
 - 每次壓縮後第一個動作都是 todo_write 更新清單，接著直接做下一個資料夾。
 - read_file 31 → 25：本次壓縮後**沒有重讀**（run1 有 1 次 6 檔重讀）。注意（推論）：本次壓縮都落在 edit 批次之後、而非剛讀完檔時，重讀減少可能主要來自壓縮時機不同，不能全歸功於清單；各 1 次樣本。
@@ -178,7 +178,7 @@
 - 不採納：mini_repo 太小、grep 兩次就能解——刻意保留（答案可客觀核對；比的是主對話 context 有沒有被灌，不是 subagent 是否必要），已寫進文件。
 - 修正後驗證：pytest `239 passed`；舊 log 跑 summarize_log 正常。進真實測驗。
 
-### v4-3 真實測驗（logs/v4-sub-run-task.jsonl vs logs/v4-sub-run-control.jsonl）— 通過（HANDOFF v4 完成標準）
+### v4-3 真實測驗（evidence/logs/v4-sub-run-task.jsonl vs evidence/logs/v4-sub-run-control.jsonl）— 通過（HANDOFF v4 完成標準）
 | | 實驗組（task） | 對照組（自己搜） |
 |---|---|---|
 | 主對話輪數 | 2 | 7 |
@@ -204,7 +204,7 @@
 - 建議（皆採納）：HOOKS_FILE 相對路徑對專案根解析；hook log 直接記 path（judge 優先用、normpath 正規化）；文件補「hook 腳本每次重讀，allow_all 下模型可改腳本」；補 OSError/非 UTF-8/surrogate/巨量輸出測試。
 - 修正後驗證：pytest `270 passed`；指揮官實測非 UTF-8 stderr 的 post hook → 回報附加、工具結果保留、不崩。進真實測驗。
 
-### v4-4 真實測驗（logs/v4-hooks-run1.jsonl）— 通過
+### v4-4 真實測驗（evidence/logs/v4-hooks-run1.jsonl）— 通過
 - v4-hooks 判定全 PASS：第 3 輪模型用 `print(..., file=sys.stderr)` → hook exit 2 ×2（回報行號＋規則）→ 第 4 輪模型說「依專案規定，把 print 改成 logging」，加 import logging／logger、改 logger.debug → 同批第 1 個 edit 時另一處 print 還在（exit 2），後兩個 edit 後 exit 0。最終 orders.py 無 print。
 - post 回報**沒設 is_error**，模型仍注意到並修正——尾端附文字的回饋就足夠。
 - 模型自行驗證 A17 失敗是既有的：在 /tmp 做一份去掉改動的副本跑基準（bash 經詢問、使用者回 a）。觀察：這條指令寫到 WORKDIR 外（/tmp），權限層有攔下詢問，屬人核准；同 v3 的「a 等同一次性 y，要讀內容」提醒。

@@ -38,7 +38,7 @@ cp fixtures/memory/CLAUDE.md sandbox/CLAUDE.md
 rm sandbox/CLAUDE.md   # 做完移除，避免影響其他測驗
 ```
 預期：啟動時印 `📒 已載入 sandbox/CLAUDE.md`，第一次 bash 就用 `python3`；`summarize_log.py` 的「v4-記憶判定」三項都過。
-對照組：同一版程式、`sandbox/` 裡沒有 `CLAUDE.md` 的那次（`logs/v4-mem-control.jsonl`）：第 2 輪用了 `python`、exit 127，第 3 輪才改 `python3`。
+對照組：同一版程式、`sandbox/` 裡沒有 `CLAUDE.md` 的那次（`evidence/logs/v4-mem-control.jsonl`）：第 2 輪用了 `python`、exit 127，第 3 輪才改 `python3`。
 
 ## v4-TODO 實驗（TODO 工具：模型會不會自發使用）
 沿用 v3 的 docstring_repo 和任務句，**任務句不提 TODO、system prompt 也沒有 TODO 說明**，只有 `todo_write` 的工具描述；觀察模型會不會自己先列清單、邊做邊更新。

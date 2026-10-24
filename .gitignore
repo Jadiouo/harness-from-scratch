@@ -1,5 +1,5 @@
 .venv/
-logs/
+/logs/
 sandbox/
 __pycache__/
 .scratch/
